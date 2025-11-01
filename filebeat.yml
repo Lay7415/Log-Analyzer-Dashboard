@@ -4,13 +4,25 @@ filebeat.inputs:
   paths:
   - /var/log/nginx/access.log
   fields:
-    source: nginx
+    log_type: "access"
   fields_under_root: true
+
+- type: log
+  enabled: true
+  paths:
+  - /var/log/nginx/error.log
+  fields:
+    log_type: "error"
+  fields_under_root: true
+  multiline:
+    pattern: '^[0-9]{4}/[0-9]{2}/[0-9]{2}'
+    negate: true
+    match: after
 
 output.kafka:
   hosts: [ "kafka:9092" ]
   topic: "nginx_logs"
-  codec.format:
-    string: '%{[message]}'
+  codec.json:
+    pretty: false
   required_acks: 1
   max_message_bytes: 1000000

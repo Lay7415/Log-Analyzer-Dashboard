@@ -1,8 +1,6 @@
-# streamlit/Dockerfile
 
 FROM python:3.11-slim
 
-# Устанавливаем все библиотеки одним слоем
 RUN pip install --no-cache-dir streamlit pandas clickhouse-driver plotly pycountry-convert
 
 WORKDIR /app

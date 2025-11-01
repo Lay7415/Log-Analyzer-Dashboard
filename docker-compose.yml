@@ -55,7 +55,7 @@ services:
     container_name: spark
     user: root
     volumes:
-      - ./spark:/opt/spark-apps  # Монтируем всю папку spark
+      - ./spark:/opt/spark-apps  
       - ./spark/ivy:/home/spark/.ivy2
     depends_on:
       - kafka

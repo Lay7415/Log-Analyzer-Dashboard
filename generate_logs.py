@@ -5,19 +5,23 @@ from faker import Faker
 
 fake = Faker()
 
-LOG_FILE_PATH = "./nginx/logs/access.log"
+# --- Пути к файлам ---
+ACCESS_LOG_FILE_PATH = "./nginx/logs/access.log"
+ERROR_LOG_FILE_PATH = "./nginx/logs/error.log"
 NUM_LOG_LINES = 10000
+NUM_ERROR_LINES = 150
 
-print("Подготовка пулов реалистичных данных...")
+print("Подготовка пулов реалистичных данных для access.log...")
 
 IP_POOL = [fake.ipv4() for _ in range(200)]
 ip_weights = ([0.04] * 10) + ([0.00315] * 190)
 
 pages = [
     "/", "/products/123", "/api/v1/users", "/cart", "/login",
-    "/products/456", "/checkout", "/blog/article-1", "/contact-us", "/api/v2/items"
+    "/products/456", "/checkout", "/blog/article-1", "/contact-us", "/api/v2/items",
+    "/admin/panel", "/static/style.css", "/images/logo.png", "/uploads/document.pdf"
 ]
-page_weights = [0.30, 0.15, 0.10, 0.10, 0.08, 0.08, 0.07, 0.04, 0.04, 0.04]
+page_weights = [0.25, 0.15, 0.10, 0.10, 0.08, 0.08, 0.05, 0.04, 0.04, 0.03, 0.01, 0.01, 0.01, 0.01]
 
 USER_AGENT_POOL = [fake.user_agent() for _ in range(100)]
 http_statuses = [200, 301, 404, 500, 403]
@@ -37,10 +41,10 @@ def get_random_timestamp():
         ts = random.uniform(start_time.timestamp(), end_time.timestamp())
     return datetime.fromtimestamp(ts, tz=timezone.utc)
 
-print(f"Генерация {NUM_LOG_LINES} строк логов в файл {LOG_FILE_PATH}...")
+print(f"Генерация {NUM_LOG_LINES} строк логов в файл {ACCESS_LOG_FILE_PATH}...")
 print(f"Временной диапазон: от {start_time.strftime('%H:%M:%S')} до {end_time.strftime('%H:%M:%S')}")
 
-with open(LOG_FILE_PATH, "w") as f:
+with open(ACCESS_LOG_FILE_PATH, "w") as f:
     log_entries = []
     for _ in range(NUM_LOG_LINES):
         log_time = get_random_timestamp()
@@ -73,4 +77,28 @@ with open(LOG_FILE_PATH, "w") as f:
         log_line = f'{anomaly_ip} - - [{timestamp_str}] "{request}" 403 150 "{fake.uri()}" "{random.choice(USER_AGENT_POOL)}"\n'
         f.write(log_line)
 
-print("Генерация завершена.")
+print(f"Генерация {NUM_ERROR_LINES} строк логов в файл {ERROR_LOG_FILE_PATH}...")
+error_levels = ["error", "warn"]
+error_messages = [
+    'open() "/usr/share/nginx/html/favicon.ico" failed (2: No such file or directory)',
+    'directory index of "/usr/share/nginx/html/images/" is forbidden',
+    'access forbidden by rule',
+    'client sent invalid method while reading client request line'
+]
+
+with open(ERROR_LOG_FILE_PATH, "w") as f:
+    error_entries = []
+    for _ in range(NUM_ERROR_LINES):
+        log_time = get_random_timestamp()
+        timestamp_str = log_time.strftime('%Y/%m/%d %H:%M:%S')
+        level = random.choice(error_levels)
+        message = random.choice(error_messages)
+        ip = random.choice(IP_POOL)
+        
+        log_line = f'{timestamp_str} [{level}] 12345#12345: *6789 client: {ip}, server: localhost, request: "GET /some/problematic/path HTTP/1.1", {message}, host: "localhost:8080"\n'
+        error_entries.append((log_time, log_line))
+
+    error_entries.sort(key=lambda x: x[0])
+    for _, log_line in error_entries:
+        f.write(log_line)
+print("Генерация error.log завершена.")

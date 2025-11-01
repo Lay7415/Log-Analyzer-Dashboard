@@ -1,13 +1,22 @@
 CREATE TABLE IF NOT EXISTS nginx_logs (
-    ip String,
-    time String,
-    request String,
-    status UInt16,
-    bytes UInt32,
-    referrer String,
-    agent String,
     timestamp DateTime,
+    ip String,
     country LowCardinality(String),
-    is_anomaly UInt8
+    log_type LowCardinality(String),
+
+    request Nullable(String),
+    method Nullable(String),
+    page Nullable(String),
+    status Nullable(UInt16),
+    bytes Nullable(UInt32),
+    referrer Nullable(String),
+    agent Nullable(String),
+
+    log_level LowCardinality(Nullable(String)),
+    error_message Nullable(String),
+
+    is_anomaly UInt8,
+    anomaly_type String
+
 ) ENGINE = MergeTree()
 ORDER BY timestamp;
