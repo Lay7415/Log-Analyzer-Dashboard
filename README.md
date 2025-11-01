@@ -1,39 +1,15 @@
 # Real-Time Log Analytics and Anomaly Detection Platform
 
-<style>
-.gallery{display:flex;flex-direction:column;gap:8px;width:100%;}
-.gallery .row{display:flex;gap:8px;align-items:stretch;flex-wrap:nowrap;}
-.gallery .large{flex:2 1 60%;min-width:220px;}
-.gallery .column{flex:1 1 35%;display:flex;flex-direction:column;gap:8px;min-width:140px;}
-.gallery img{width:100%;height:100%;object-fit:cover;border-radius:6px;display:block;}
-@media (max-width:900px){
-    .gallery .row{flex-direction:column;}
-    .gallery .column{flex-direction:row;}
-    .gallery .column img{height:auto;}
-}
-</style>
-
-<div class="gallery">
-    <div class="row">
-        <div class="large">
-            <img src="./images/image.png" alt="image 1">
-        </div>
-        <div class="column">
-            <img src="./images/image-1.png" alt="image 2">
-            <img src="./images/image-2.png" alt="image 3">
-        </div>
-    </div>
-    <div class="row">
-        <div class="large">
-            <img src="./images/image-3.png" alt="image 4">
-        </div>
-        <div class="column">
-            <img src="./images/image-4.png" alt="image 5">
-            <img src="./images/image-5.png" alt="image 6">
-        </div>
-    </div>
-</div>
-
+<p align="center">
+  <img src="./images/image.png" width="30%" />
+  <img src="./images/image-1.png" width="30%" />
+  <img src="./images/image-2.png" width="30%" />
+</p>
+<p align="center">
+  <img src="./images/image-3.png" width="30%" />
+  <img src="./images/image-4.png" width="30%" />
+  <img src="./images/image-5.png" width="30%" />
+</p>
 
 
 Этот проект представляет собой комплексную платформу для сбора, обработки и анализа логов веб-сервера Nginx в режиме, близком к реальному времени. Система не только визуализирует данные на интерактивном дашборде, но и использует потоковую обработку для выявления аномалий в трафике, а также включает в себя модуль для прогнозирования будущей нагрузки на сервер.
