@@ -4,6 +4,7 @@ from clickhouse_driver import Client
 import plotly.express as px
 import pycountry_convert as pc
 from datetime import datetime, timedelta
+import altair as alt
 
 # --- Конфигурация страницы и подключение к БД ---
 st.set_page_config(page_title="Log Dashboard", layout="wide")
@@ -123,8 +124,8 @@ kpi5.metric("Ошибки сервера (5xx %)", f"{server_error_rate:.2f}%")
 st.markdown("---")
 
 # --- Вкладки с графиками ---
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["📈 Обзор и динамика", "🌍 Гео-аналитика", "🚦 Топ-листы и статусы", "🚨 Детекция аномалий", "🔧 Анализ ошибок сервера"]
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["📈 Обзор и динамика", "🌍 Гео-аналитика", "🚦 Топ-листы и статусы", "🚨 Детекция аномалий", "🔧 Анализ ошибок сервера", "🔮 Прогнозирование и Рекомендации"]
 )
 
 # --- ВКЛАДКА 1: Обзор и динамика ---
@@ -303,3 +304,79 @@ with tab5:
         st.dataframe(df_errors_table, use_container_width=True)
     else:
         st.info("Ошибки сервера не найдены в выбранном диапазоне.")
+        
+with tab6:
+    st.subheader("Прогноз нагрузки на сервер (запросов в час)")
+    
+    # 1. Загружаем фактические данные за последние 3 дня
+    actuals_query = """
+    SELECT toStartOfHour(timestamp) as hour, count() as actual_requests
+    FROM nginx_logs
+    WHERE log_type = 'access' AND timestamp >= now() - INTERVAL 3 DAY
+    GROUP BY hour ORDER BY hour
+    """
+    df_actuals = run_query(CLIENT, actuals_query)
+    
+    # 2. Загружаем прогнозные данные
+    predictions_query = "SELECT timestamp as hour, predicted_requests, predicted_lower, predicted_upper FROM nginx_predictions ORDER BY hour"
+    df_predictions = run_query(CLIENT, predictions_query)
+
+    if not df_actuals.empty and not df_predictions.empty:
+        # --- Блок предписывающей аналитики ---
+        CRITICAL_LOAD_THRESHOLD = df_actuals['actual_requests'].quantile(0.95) # Порог = 95-й перцентиль исторической нагрузки
+        
+        future_predictions = df_predictions[df_predictions['hour'] > datetime.now()]
+        peak_prediction = future_predictions.sort_values('predicted_upper', ascending=False).iloc[0]
+
+        st.info(f"**Прогноз:** Ожидается пиковая нагрузка **~{int(peak_prediction['predicted_requests'])}** запросов/час в **{peak_prediction['hour'].strftime('%Y-%m-%d %H:%M')}**.")
+
+        if peak_prediction['predicted_upper'] > CRITICAL_LOAD_THRESHOLD:
+            st.error(
+                f"""
+                **⚠️ РЕКОМЕНДАЦИЯ (Предписывающая аналитика):**
+                Прогнозируемая пиковая нагрузка ({int(peak_prediction['predicted_upper'])} запросов/час) превышает критический порог ({int(CRITICAL_LOAD_THRESHOLD)} запросов/час).
+                **Рекомендуется рассмотреть возможность масштабирования ресурсов веб-сервера (например, увеличения количества подов/контейнеров) перед пиковым временем.**
+                """
+            )
+        else:
+            st.success(
+                """
+                **✅ РЕКОМЕНДАЦИЯ (Предписывающая аналитика):**
+                Прогнозируемая нагрузка находится в пределах нормы. Дополнительных действий не требуется.
+                """
+            )
+
+        # --- Визуализация ---
+        # Преобразуем для Altair
+        df_actuals['type'] = 'Фактические данные'
+        df_actuals.rename(columns={'actual_requests': 'requests'}, inplace=True)
+        
+        df_pred_main = df_predictions[['hour', 'predicted_requests']].copy()
+        df_pred_main['type'] = 'Прогноз'
+        df_pred_main.rename(columns={'predicted_requests': 'requests'}, inplace=True)
+
+        # Соединяем для основного графика
+        source = pd.concat([df_actuals[['hour', 'requests', 'type']], df_pred_main])
+
+        # Основной график
+        line = alt.Chart(source).mark_line().encode(
+            x='hour:T',
+            y='requests:Q',
+            color='type:N'
+        ).properties(
+             title='Сравнение фактической нагрузки и прогноза'
+        )
+
+        # Область неопределенности для прогноза
+        band = alt.Chart(df_predictions).mark_area(opacity=0.3).encode(
+            x='hour:T',
+            y='predicted_lower:Q',
+            y2='predicted_upper:Q'
+        ).properties(
+            title='Доверительный интервал прогноза'
+        )
+        
+        st.altair_chart((band + line).interactive(), use_container_width=True)
+
+    else:
+        st.warning("Нет данных для построения прогноза. Сначала необходимо запустить скрипты обучения и генерации прогнозов.")

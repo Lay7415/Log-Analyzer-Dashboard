@@ -2,8 +2,8 @@ FROM apache/spark:3.4.1
 
 USER root
 
-RUN apt-get update && apt-get install -y python3-pip && \
-    pip install --no-cache-dir kafka-python clickhouse-driver pyspark geoip2
+RUN apt-get update && apt-get install -y python3-pip build-essential libssl-dev libffi-dev python3-dev && \
+    pip install --no-cache-dir kafka-python clickhouse-driver pyspark geoip2 prophet
 
 WORKDIR /opt/spark-apps
 

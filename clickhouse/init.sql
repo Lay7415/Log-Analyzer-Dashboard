@@ -20,3 +20,11 @@ CREATE TABLE IF NOT EXISTS nginx_logs (
 
 ) ENGINE = MergeTree()
 ORDER BY timestamp;
+
+CREATE TABLE IF NOT EXISTS nginx_predictions (
+    timestamp DateTime,
+    predicted_requests Float64,
+    predicted_lower Float64,
+    predicted_upper Float64
+) ENGINE = MergeTree()
+ORDER BY timestamp;
