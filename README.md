@@ -1,15 +1,19 @@
 # Real-Time Log Analytics and Anomaly Detection Platform
 
-<p align="center">
-  <img src="./images/image.png" width="30%" />
-  <img src="./images/image-1.png" width="30%" />
-  <img src="./images/image-2.png" width="30%" />
-</p>
-<p align="center">
-  <img src="./images/image-3.png" width="30%" />
-  <img src="./images/image-4.png" width="30%" />
-  <img src="./images/image-5.png" width="30%" />
-</p>
+<div align="center">
+
+  <!-- Верхний ряд -->
+  <img src="./images/image.png" width="32%" />
+  <img src="./images/image-1.png" width="32%" />
+  <img src="./images/image-2.png" width="32%" />
+  <br>
+
+  <!-- Средний ряд -->
+  <img src="./images/image-3.png" width="32%" />
+  <img src="./images/image-4.png" width="32%" />
+  <img src="./images/image-5.png" width="32%" />
+
+</div>
 
 
 Этот проект представляет собой комплексную платформу для сбора, обработки и анализа логов веб-сервера Nginx в режиме, близком к реальному времени. Система не только визуализирует данные на интерактивном дашборде, но и использует потоковую обработку для выявления аномалий в трафике, а также включает в себя модуль для прогнозирования будущей нагрузки на сервер.
