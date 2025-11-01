@@ -359,19 +359,29 @@ with tab6:
         source = pd.concat([df_actuals[['hour', 'requests', 'type']], df_pred_main])
 
         # Основной график
-        line = alt.Chart(source).mark_line().encode(
-            x='hour:T',
-            y='requests:Q',
-            color='type:N'
+        line = alt.Chart(source).mark_line(point=True).encode(
+            x=alt.X('hour:T', title='Время'),
+            y=alt.Y('requests:Q', title='Количество запросов'),
+            color=alt.Color('type:N', title='Тип данных'),
+            tooltip=[
+                alt.Tooltip('hour:T', title='Время'),
+                alt.Tooltip('requests:Q', title='Запросов', format=',.0f'),
+                alt.Tooltip('type:N', title='Тип')
+            ]
         ).properties(
              title='Сравнение фактической нагрузки и прогноза'
         )
 
         # Область неопределенности для прогноза
         band = alt.Chart(df_predictions).mark_area(opacity=0.3).encode(
-            x='hour:T',
-            y='predicted_lower:Q',
-            y2='predicted_upper:Q'
+            x=alt.X('hour:T'),
+            y=alt.Y('predicted_lower:Q'),
+            y2='predicted_upper:Q',
+            tooltip=[
+                alt.Tooltip('hour:T', title='Время'),
+                alt.Tooltip('predicted_lower:Q', title='Мин. прогноз', format=',.0f'),
+                alt.Tooltip('predicted_upper:Q', title='Макс. прогноз', format=',.0f')
+            ]
         ).properties(
             title='Доверительный интервал прогноза'
         )
