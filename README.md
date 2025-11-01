@@ -12,7 +12,6 @@
   <img src="./images/image-3.png" width="32%" />
   <img src="./images/image-4.png" width="32%" />
   <img src="./images/image-5.png" width="32%" />
-
 </div>
 
 
