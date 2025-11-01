@@ -245,7 +245,7 @@ with tab4:
     col1, col2 = st.columns([2,1])
     with col1:
         st.subheader("Временная шкала аномалий (Timeline)")
-        anomaly_timeline_query = f"SELECT timestamp, ip, anomaly_type FROM nginx_logs {anomaly_where} AND is_anomaly = 1 ORDER BY timestamp DESC LIMIT 500"
+        anomaly_timeline_query = f"SELECT timestamp, ip, anomaly_type FROM nginx_logs {anomaly_where} AND is_anomaly = 1 AND anomaly_type != '' ORDER BY timestamp DESC LIMIT 500"
         df_anomalies_timeline = run_query(CLIENT, anomaly_timeline_query)
         if not df_anomalies_timeline.empty:
             fig_timeline = px.scatter(df_anomalies_timeline, x='timestamp', y='ip', color='anomaly_type',
@@ -257,14 +257,14 @@ with tab4:
 
     with col2:
         st.subheader("Распределение по типам аномалий")
-        anomaly_pie_query = f"SELECT anomaly_type, count() as cnt FROM nginx_logs {anomaly_where} AND is_anomaly = 1 GROUP BY anomaly_type"
+        anomaly_pie_query = f"SELECT anomaly_type, count() as cnt FROM nginx_logs {anomaly_where} AND is_anomaly = 1 AND anomaly_type != '' GROUP BY anomaly_type"
         df_anomaly_pie = run_query(CLIENT, anomaly_pie_query)
         if not df_anomaly_pie.empty:
             fig_pie = px.pie(df_anomaly_pie, names='anomaly_type', values='cnt')
             st.plotly_chart(fig_pie, use_container_width=True)
 
     st.subheader("Сводная таблица по аномалиям")
-    anomaly_table_query = f"SELECT ip, country, anomaly_type, max(timestamp) as last_seen, count() as request_count FROM nginx_logs {anomaly_where} AND is_anomaly = 1 GROUP BY ip, country, anomaly_type ORDER BY last_seen DESC LIMIT 20"
+    anomaly_table_query = f"SELECT ip, country, anomaly_type, max(timestamp) as last_seen, count() as request_count FROM nginx_logs {anomaly_where} AND is_anomaly = 1 AND anomaly_type != '' GROUP BY ip, country, anomaly_type ORDER BY last_seen DESC LIMIT 20"
     df_anomalies_table = run_query(CLIENT, anomaly_table_query)
     if not df_anomalies_table.empty:
         st.dataframe(df_anomalies_table, use_container_width=True)
