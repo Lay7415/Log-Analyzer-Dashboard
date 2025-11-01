@@ -1,4 +1,4 @@
-
+    
 FROM python:3.11-slim
 
 RUN pip install --no-cache-dir streamlit pandas clickhouse-driver plotly pycountry-convert
