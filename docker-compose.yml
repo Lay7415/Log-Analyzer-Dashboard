@@ -40,6 +40,7 @@ services:
       - ./nginx/logs:/var/log/nginx:ro
     depends_on:
       - kafka
+      - log_generator
 
   clickhouse:
     image: yandex/clickhouse-server:latest
@@ -64,6 +65,19 @@ services:
       bash -c "/opt/spark/bin/spark-submit
       --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.1,com.clickhouse:clickhouse-jdbc:0.4.6
       /opt/spark-apps/spark_processor.py"
+
+  log_generator:
+      image: python:3.11-slim
+      container_name: log_generator
+      volumes:
+        - ./nginx/logs:/var/log/nginx
+        - ./generate_logs.py:/app/generate_logs.py
+      # УДАЛИТЬ command, чтобы он использовал CMD/ENTRYPOINT из Dockerfile или просто работал
+      # command: >
+      #   sh -c "pip install faker && python3 /app/generate_logs.py && echo 'Log generation finished.'"
+      command: sh -c "pip install faker && python3 /app/generate_logs.py" # Оставить, чтобы установить faker и запустить скрипт бесконечно
+      depends_on:
+        - nginx
 
   streamlit:
     build:
