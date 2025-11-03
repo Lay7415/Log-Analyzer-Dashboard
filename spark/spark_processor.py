@@ -77,8 +77,11 @@ def get_country_from_ip(ip):
 kafka_schema = StructType([StructField("message", StringType()), StructField("log_type", StringType())])
 df = spark.readStream.format("kafka").option("kafka.bootstrap.servers", KAFKA_BROKER).option("subscribe", TOPIC).option("startingOffsets", "earliest").load()
 json_df = df.select(from_json(col("value").cast("string"), kafka_schema).alias("data")).select("data.*")
+
 access_pattern = r'(\S+) - - \[(.*?)\] "(\S+)\s*(\S*)\s*(\S*)" (\d{3}) (\d+) "(.*?)" "(.*?)"'
+
 error_pattern = r'(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) \[(\w+)\] .*? client: (\S+), server: .*?, request: ".*?", (.*?), host: ".*?"'
+
 access_logs = json_df.filter(col("log_type") == "access").select(
     regexp_extract("message", access_pattern, 1).alias("ip"),
     regexp_extract("message", access_pattern, 2).alias("time"),

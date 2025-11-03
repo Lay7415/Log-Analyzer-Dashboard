@@ -29,8 +29,8 @@ status_weights = [0.8, 0.05, 0.08, 0.02, 0.05]
 
 print("Настройка временного диапазона для логов...")
 end_time = datetime.now(timezone.utc)
-start_time = end_time - timedelta(hours=3)
-peak_time_start = end_time - timedelta(hours=2)
+start_time = end_time - timedelta(hours=6)
+peak_time_start = end_time - timedelta(hours=3)
 peak_time_end = end_time - timedelta(hours=1)
 
 def get_random_timestamp():
