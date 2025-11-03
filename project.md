@@ -59,15 +59,15 @@ services:
     container_name: spark
     user: root
     volumes:
-      - ./spark:/opt/spark-apps  
+      - ./spark:/opt/spark-apps
       - ./spark/ivy:/home/spark/.ivy2
     depends_on:
       - kafka
       - clickhouse
     command: >
-      bash -c "/opt/spark/bin/spark-submit
-      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.1,com.clickhouse:clickhouse-jdbc:0.4.6
-      /opt/spark-apps/spark_processor.py"
+      bash -c "until curl -sS http://clickhouse:8123/ >/dev/null 2>&1; do echo 'waiting clickhouse...'; sleep 2; done;
+      /opt/spark/bin/spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.1,com.clickhouse:clickhouse-jdbc:0.4.6 /opt/spark-apps/spark_processor.py"
+
 
   log_generator:
       image: python:3.11-slim
@@ -75,10 +75,7 @@ services:
       volumes:
         - ./nginx/logs:/var/log/nginx
         - ./generate_logs.py:/app/generate_logs.py
-      # УДАЛИТЬ command, чтобы он использовал CMD/ENTRYPOINT из Dockerfile или просто работал
-      # command: >
-      #   sh -c "pip install faker && python3 /app/generate_logs.py && echo 'Log generation finished.'"
-      command: sh -c "pip install faker && python3 /app/generate_logs.py" # Оставить, чтобы установить faker и запустить скрипт бесконечно
+      command: sh -c "pip install faker && python3 /app/generate_logs.py"
       depends_on:
         - nginx
 
@@ -345,58 +342,65 @@ http {
 ### clickhouse/init.sql
 
 ```
--- clickhouse/init.sql
+-- Dimension Tables
+-- Using ReplacingMergeTree to handle deduplication automatically based on the ID.
 
--- 1. Таблица Измерения: Время (для лучшей организации/анализа, хотя в CH DateTime и так хорош)
-CREATE TABLE IF NOT EXISTS dim_time (
-    time_id DateTime,
-    hour UInt8,
-    day_of_week UInt8,
-    is_weekend UInt8
-) ENGINE = MergeTree()
-ORDER BY time_id;
-
--- 2. Таблица Измерения: IP / Геолокация
--- Используем MATERIALIZED/ReplacingMergeTree для генерации ключа (ip_id) и обновления/удаления устаревших записей
 CREATE TABLE IF NOT EXISTS dim_ip (
-    ip_id UInt64 MATERIALIZED toUInt64(abs(cityHash64(ip))), -- Простой хэш как ID
+    ip_id UInt64,
     ip String,
     country LowCardinality(String)
-) ENGINE = ReplacingMergeTree(ip_id) -- Используем Replacing для обновления записей с тем же IP
-ORDER BY ip;
+) ENGINE = ReplacingMergeTree(ip_id)
+ORDER BY ip_id;
 
--- 3. Таблица Измерения: Типы Аномалий и Логирования
+CREATE TABLE IF NOT EXISTS dim_request (
+    request_id UInt64,
+    request Nullable(String),
+    method LowCardinality(Nullable(String)),
+    page Nullable(String),
+    referrer Nullable(String)
+) ENGINE = ReplacingMergeTree(request_id)
+ORDER BY request_id;
+
+CREATE TABLE IF NOT EXISTS dim_user_agent (
+    agent_id UInt64,
+    agent Nullable(String)
+) ENGINE = ReplacingMergeTree(agent_id)
+ORDER BY agent_id;
+
 CREATE TABLE IF NOT EXISTS dim_anomaly_type (
-    anomaly_type_id UInt8 MATERIALIZED toUInt8(abs(cityHash64(anomaly_type, is_anomaly) % 255)), -- Простой ID
-    anomaly_type String,
-    is_anomaly UInt8 -- 1 или 0
+    anomaly_type_id UInt64,
+    anomaly_type String
 ) ENGINE = ReplacingMergeTree(anomaly_type_id)
-ORDER BY anomaly_type;
+ORDER BY anomaly_type_id;
 
--- 4. Таблица Фактов: События Nginx
-CREATE TABLE IF NOT EXISTS fact_nginx_requests (
-    -- Ключи Измерений (Foreign Keys)
-    time_key DateTime,        -- Ключ времени (ссылка на dim_time, или просто DateTime)
-    ip_key UInt64,             -- Ключ IP (ссылка на dim_ip.ip_id)
-    anomaly_type_key UInt8,    -- Ключ типа аномалии (ссылка на dim_anomaly_type.anomaly_type_id)
-    log_type LowCardinality(String), -- Разделение на access/error
-
-    -- Метрики (Values)
-    status UInt16,
-    bytes UInt32,
-
-    -- Текст ошибки (для ошибок, не помещается в размерности)
-    error_message Nullable(String),
-
-    -- Поля для ускорения поиска (для логов ошибок)
-    method Nullable(String),
-    page Nullable(String)
-) ENGINE = MergeTree()
-PARTITION BY toYYYYMM(time_key)
-ORDER BY (time_key, ip_key);
+CREATE TABLE IF NOT EXISTS dim_error_details (
+    error_details_id UInt64,
+    log_level LowCardinality(Nullable(String)),
+    error_message Nullable(String)
+) ENGINE = ReplacingMergeTree(error_details_id)
+ORDER BY error_details_id;
 
 
--- Таблица для прогнозов остается
+-- Fact Table
+CREATE TABLE IF NOT EXISTS fact_nginx_events (
+    timestamp DateTime,
+    log_type LowCardinality(String),
+
+    ip_id UInt64,
+    request_id Nullable(UInt64),
+    agent_id Nullable(UInt64),
+    error_details_id Nullable(UInt64),
+    anomaly_type_id Nullable(UInt64),
+
+    status Nullable(UInt16),
+    bytes Nullable(UInt32),
+    is_anomaly UInt8
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (timestamp, ip_id);
+
+-- Predictions table remains unchanged
 CREATE TABLE IF NOT EXISTS nginx_predictions (
     timestamp DateTime,
     predicted_requests Float64,
@@ -417,18 +421,19 @@ import pycountry_convert as pc
 from datetime import datetime, timedelta
 import altair as alt
 
-# --- Конфигурация страницы и подключение к БД ---
+
 st.set_page_config(page_title="Log Dashboard", layout="wide")
+
 
 @st.cache_resource
 def get_clickhouse_client():
     client = Client(host="clickhouse", port=9000)
     return client
 
+
 CLIENT = get_clickhouse_client()
 
 
-# --- Вспомогательные функции ---
 @st.cache_data(ttl=60)
 def run_query(_client, query):
     """Выполняет запрос к ClickHouse и возвращает DataFrame."""
@@ -444,41 +449,24 @@ def run_query(_client, query):
 
 
 def get_country_iso_alpha3(country_name):
-    """Преобразует название страны в ISO Alpha-3 код для карты."""
+
     try:
         return pc.country_name_to_country_alpha3(country_name)
     except:
         return None
 
-# --- Основной интерфейс ---
+
 st.title("📊 Комплексная аналитика логов веб-сервера (Star Schema)")
 
 
-# --- Боковая панель с фильтры ---
 st.sidebar.title("Фильтры")
-
-# --- ПРОВЕРКА ГОТОВНОСТИ DIM ТАБЛИЦ (НОВОЕ) ---
-dim_check_df = run_query(CLIENT, "SELECT count() FROM dim_ip")
-if dim_check_df.empty or dim_check_df.iloc[0, 0] == 0:
-    st.error("⚠️ DIM таблица 'dim_ip' пуста. Пожалуйста, убедитесь, что 'spark_processor' запущен и обработал первые логи.")
-    st.stop() # Останавливаем выполнение скрипта, чтобы избежать ошибок JOIN
-# -------------------------------------------------
-
-# Запрос для определения диапазона времени теперь идет к таблице Фактов
-min_max_time_df = run_query(CLIENT, "SELECT min(time_key), max(time_key) FROM fact_nginx_requests")
+min_max_time_df = run_query(
+    CLIENT, "SELECT min(timestamp), max(timestamp) FROM fact_nginx_events"
+)
 if not min_max_time_df.empty and min_max_time_df.iloc[0, 0] is not None:
-    min_ts = min_max_time_df.iloc[0, 0]
-    max_ts = min_max_time_df.iloc[0, 1]
 
-    # ИСПРАВЛЕНИЕ: Принудительно конвертируем pandas.Timestamp в стандартный python datetime
-    min_dt = min_ts.to_pydatetime()
-    max_dt = max_ts.to_pydatetime()
-
-    # ИСПРАВЛЕНИЕ: Проверка, если min == max
-    if min_dt >= max_dt:
-        max_dt = min_dt + timedelta(minutes=1) 
-        st.warning("В данных обнаружен только один временной интервал. Слайдер расширен на 1 минуту.")
-
+    min_dt = min_max_time_df.iloc[0, 0].to_pydatetime()
+    max_dt = min_max_time_df.iloc[0, 1].to_pydatetime()
     time_range = st.sidebar.slider(
         "Временной диапазон",
         min_value=min_dt,
@@ -490,89 +478,127 @@ if not min_max_time_df.empty and min_max_time_df.iloc[0, 0] is not None:
 else:
     start_time, end_time = datetime.now() - timedelta(hours=1), datetime.now()
 
-# Запросы к DIM таблицам для получения доступных значений
-statuses_df = run_query(CLIENT, "SELECT DISTINCT status FROM fact_nginx_requests WHERE status IS NOT NULL ORDER BY status")
-methods_df = run_query(CLIENT, "SELECT DISTINCT method FROM fact_nginx_requests WHERE method IS NOT NULL AND method != '' ORDER BY method")
 
-# Запрос для получения стран (из DIM таблицы)
-countries_df = run_query(CLIENT, "SELECT DISTINCT country FROM dim_ip WHERE country IS NOT NULL AND country != 'Unknown' AND country != 'Error' ORDER BY country")
+statuses_df = run_query(
+    CLIENT,
+    "SELECT DISTINCT status FROM fact_nginx_events WHERE status IS NOT NULL ORDER BY status",
+)
+countries_df = run_query(
+    CLIENT,
+    "SELECT DISTINCT country FROM dim_ip WHERE country IS NOT NULL AND country != 'Unknown' AND country != 'Error' ORDER BY country",
+)
+methods_df = run_query(
+    CLIENT,
+    "SELECT DISTINCT method FROM dim_request WHERE method IS NOT NULL AND method != '' ORDER BY method",
+)
 
 all_statuses = statuses_df["status"].tolist() if not statuses_df.empty else []
 all_countries = countries_df["country"].tolist() if not countries_df.empty else []
 all_methods = methods_df["method"].tolist() if not methods_df.empty else []
 
-selected_statuses = st.sidebar.multiselect("Статус ответа", all_statuses, default=all_statuses)
-selected_countries = st.sidebar.multiselect("Страна", all_countries, default=all_countries)
-selected_methods = st.sidebar.multiselect("Метод запроса", all_methods, default=all_methods)
+selected_statuses = st.sidebar.multiselect(
+    "Статус ответа", all_statuses, default=all_statuses
+)
+selected_countries = st.sidebar.multiselect(
+    "Страна", all_countries, default=all_countries
+)
+selected_methods = st.sidebar.multiselect(
+    "Метод запроса", all_methods, default=all_methods
+)
 
 if st.sidebar.button("🔄 Применить фильтры и обновить"):
     st.rerun()
 
-# --- Формирование SQL-условия на основе фильтров ---
-where_clauses = [f"T1.time_key BETWEEN toDateTime('{start_time}') AND toDateTime('{end_time}')"]
 
-# Фильтры для Fact Table
+FROM_SQL = """
+FROM fact_nginx_events f
+LEFT JOIN dim_ip ip ON f.ip_id = ip.ip_id
+LEFT JOIN dim_request req ON f.request_id = req.request_id
+LEFT JOIN dim_user_agent ua ON f.agent_id = ua.agent_id
+LEFT JOIN dim_error_details ed ON f.error_details_id = ed.error_details_id
+LEFT JOIN dim_anomaly_type at ON f.anomaly_type_id = at.anomaly_type_id
+"""
+
+
+where_clauses = [
+    f"f.timestamp BETWEEN toDateTime('{start_time}') AND toDateTime('{end_time}')"
+]
 if selected_statuses and len(selected_statuses) != len(all_statuses):
-    where_clauses.append(f"T1.status IN {tuple(selected_statuses)}")
-if selected_methods and len(selected_methods) != len(all_methods):
-    where_clauses.append(f"T1.method IN {tuple(selected_methods)}")
-
-# Фильтр для DIM IP (Страна)
+    where_clauses.append(f"f.status IN {tuple(selected_statuses)}")
 if selected_countries and len(selected_countries) != len(all_countries):
-    # JOIN и фильтр по DIM таблице
-    where_clauses.append(f"T2.country IN {tuple(selected_countries)}")
+    where_clauses.append(f"ip.country IN {tuple(selected_countries)}")
+if selected_methods and len(selected_methods) != len(all_methods):
+    where_clauses.append(f"req.method IN {tuple(selected_methods)}")
 
-where_sql = " AND ".join(where_clauses)
-if where_sql:
-    where_sql = "WHERE " + where_sql
+where_sql = "WHERE " + " AND ".join(where_clauses)
 
-# --- KPI-метрики ---
+
+access_where_clauses = ["f.log_type = 'access'"] + where_clauses
+access_where_sql = "WHERE " + " AND ".join(access_where_clauses)
+
+
 kpi_query = f"""
 SELECT
     count() as total,
-    uniq(T1.ip_key) as unique_ips,
-    avg(T1.bytes) as avg_bytes,
-    (countIf(T1.status >= 500) / toFloat64(countIf(true))) * 100 as server_error_rate,
-    (countIf(T1.status >= 400 AND T1.status < 500) / toFloat64(countIf(true))) * 100 as client_error_rate
-FROM fact_nginx_requests AS T1
-INNER JOIN dim_ip AS T2 ON T1.ip_key = T2.ip_id
-{where_sql.replace("WHERE", "WHERE T1.log_type = 'access' AND " if "WHERE" in where_sql else "WHERE T1.log_type = 'access' AND ")}
+    uniq(ip.ip) as unique_ips,
+    avg(f.bytes) as avg_bytes,
+    (countIf(f.status >= 500) / toFloat64(countIf(true))) * 100 as server_error_rate,
+    (countIf(f.status >= 400 AND f.status < 500) / toFloat64(countIf(true))) * 100 as client_error_rate
+{FROM_SQL}
+{access_where_sql}
 """
 kpi_df = run_query(CLIENT, kpi_query)
 if not kpi_df.empty:
+
     kpi_data = kpi_df.iloc[0]
     total_requests, unique_ips, avg_bytes, server_error_rate, client_error_rate = (
-        kpi_data.get("total", 0), kpi_data.get("unique_ips", 0), kpi_data.get("avg_bytes", 0),
-        kpi_data.get("server_error_rate", 0.0), kpi_data.get("client_error_rate", 0.0)
+        kpi_data.get("total", 0),
+        kpi_data.get("unique_ips", 0),
+        kpi_data.get("avg_bytes", 0),
+        kpi_data.get("server_error_rate", 0.0),
+        kpi_data.get("client_error_rate", 0.0),
     )
 else:
-    total_requests, unique_ips, avg_bytes, server_error_rate, client_error_rate = (0, 0, 0, 0.0, 0.0)
+    total_requests, unique_ips, avg_bytes, server_error_rate, client_error_rate = (
+        0,
+        0,
+        0,
+        0.0,
+        0.0,
+    )
 
 kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
 kpi1.metric("Всего запросов", f"{total_requests:,}")
 kpi2.metric("Уникальные IP", f"{unique_ips:,}")
-kpi3.metric("Средний ответ (байт)", f"{int(avg_bytes):,}")
-kpi4.metric("Ошибки клиента (4xx %)", f"{client_error_rate:.2f}%")
-kpi5.metric("Ошибки сервера (5xx %)", f"{server_error_rate:.2f}%")
+kpi3.metric("Средний ответ (байт)", f"{int(avg_bytes or 0):,}")
+kpi4.metric("Ошибки клиента (4xx %)", f"{client_error_rate or 0:.2f}%")
+kpi5.metric("Ошибки сервера (5xx %)", f"{server_error_rate or 0:.2f}%")
 st.markdown("---")
 
-# --- Вкладки с графиками ---
+
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["📈 Обзор и динамика", "🌍 Гео-аналитика", "🚦 Топ-листы и статусы", "🚨 Детекция аномалий", "🔧 Анализ ошибок сервера", "🔮 Прогнозирование и Рекомендации"]
+    [
+        "📈 Обзор и динамика",
+        "🌍 Гео-аналитика",
+        "🚦 Топ-листы и статусы",
+        "🚨 Детекция аномалий",
+        "🔧 Анализ ошибок сервера",
+        "🔮 Прогнозирование и Рекомендации",
+    ]
 )
 
-# --- ВКЛАДКА 1: Обзор и динамика ---
+
 with tab1:
     st.subheader("Динамика запросов по типам ответов (Stacked Area Chart)")
     time_series_query_stacked = f"""
     SELECT
-        toStartOfMinute(T1.time_key) as minute,
-        countIf(T1.status >= 200 AND T1.status < 300) as success_2xx,
-        countIf(T1.status >= 300 AND T1.status < 400) as redirects_3xx,
-        countIf(T1.status >= 400 AND T1.status < 500) as client_errors_4xx,
-        countIf(T1.status >= 500) as server_errors_5xx
-    FROM fact_nginx_requests AS T1
-    {where_sql.replace("WHERE", "WHERE T1.log_type = 'access' AND " if "WHERE" in where_sql else "WHERE T1.log_type = 'access' AND ")}
+        toStartOfMinute(f.timestamp) as minute,
+        countIf(f.status >= 200 AND f.status < 300) as success_2xx,
+        countIf(f.status >= 300 AND f.status < 400) as redirects_3xx,
+        countIf(f.status >= 400 AND f.status < 500) as client_errors_4xx,
+        countIf(f.status >= 500) as server_errors_5xx
+    {FROM_SQL}
+    {access_where_sql}
     GROUP BY minute ORDER BY minute
     """
     df_time_stacked = run_query(CLIENT, time_series_query_stacked)
@@ -582,288 +608,340 @@ with tab1:
     st.subheader("Динамика среднего размера ответа (в байтах)")
     avg_bytes_query = f"""
     SELECT
-        toStartOfMinute(T1.time_key) as minute,
-        avg(T1.bytes) as avg_bytes
-    FROM fact_nginx_requests AS T1
-    {where_sql.replace("WHERE", "WHERE T1.log_type = 'access' AND " if "WHERE" in where_sql else "WHERE T1.log_type = 'access' AND ")}
+        toStartOfMinute(f.timestamp) as minute,
+        avg(f.bytes) as avg_bytes
+    {FROM_SQL}
+    {access_where_sql}
     GROUP BY minute ORDER BY minute
     """
     df_avg_bytes = run_query(CLIENT, avg_bytes_query)
     if not df_avg_bytes.empty:
         st.line_chart(df_avg_bytes.set_index("minute"))
 
-# --- ВКЛАДКА 2: Гео-аналитика ---
 with tab2:
+
     col1, col2 = st.columns(2)
+
     with col1:
         st.subheader("Карта запросов по странам")
-        # JOIN Fact с Dim IP
+
         country_query = f"""
-        SELECT 
-            T2.country, 
+        SELECT
+            ip.country AS country,
             count() as cnt
-        FROM fact_nginx_requests AS T1
-        INNER JOIN dim_ip AS T2 ON T1.ip_key = T2.ip_id
-        {where_sql.replace("WHERE", "WHERE T1.log_type = 'access' AND " if "WHERE" in where_sql else "WHERE T1.log_type = 'access' AND ")}
-        GROUP BY T2.country
+        {FROM_SQL}
+        {where_sql}
+            AND ip.country IS NOT NULL
+            AND ip.country != 'Unknown'
+            AND ip.country != 'Error'
+        GROUP BY ip.country
         """
         df_country = run_query(CLIENT, country_query)
+
         if not df_country.empty:
-            df_country["iso_alpha"] = df_country["country"].apply(get_country_iso_alpha3)
+
+            df_country["iso_alpha"] = df_country["country"].apply(
+                get_country_iso_alpha3
+            )
+
             df_country = df_country.dropna(subset=["iso_alpha"])
-            fig = px.choropleth(df_country, locations="iso_alpha", color="cnt", hover_name="country",
-                                color_continuous_scale=px.colors.sequential.Plasma, title="Количество запросов")
-            st.plotly_chart(fig, use_container_width=True)
+
+            if not df_country.empty:
+
+                fig_requests = px.choropleth(
+                    df_country,
+                    locations="iso_alpha",
+                    color="cnt",
+                    hover_name="country",
+                    color_continuous_scale=px.colors.sequential.Plasma,
+                    title="Количество запросов",
+                )
+
+                st.plotly_chart(fig_requests, use_container_width=True)
+            else:
+                st.warning(
+                    "Не удалось определить ISO-коды для стран в выбранном диапазоне."
+                )
+        else:
+            st.info("Нет данных о запросах по странам для выбранных фильтров.")
 
     with col2:
         st.subheader("Карта уровня ошибок по странам")
-        # JOIN Fact с Dim IP и фильтрация ошибок
+
         country_error_query = f"""
         SELECT
-            T2.country,
-            countIf(T1.status >= 400) as error_count,
+            ip.country AS country,
+            countIf(f.status >= 400) as error_count,
             count() as total_count,
             (error_count / toFloat64(total_count)) * 100 as error_rate
-        FROM fact_nginx_requests AS T1
-        INNER JOIN dim_ip AS T2 ON T1.ip_key = T2.ip_id
-        {where_sql.replace("WHERE", "WHERE T1.log_type = 'access' AND " if "WHERE" in where_sql else "WHERE T1.log_type = 'access' AND ")}
-        GROUP BY T2.country HAVING total_count > 0
+        {FROM_SQL}
+        {where_sql}
+            AND ip.country IS NOT NULL
+            AND ip.country != 'Unknown'
+            AND ip.country != 'Error'
+        GROUP BY ip.country
+        HAVING total_count > 0
         """
         df_country_errors = run_query(CLIENT, country_error_query)
+
         if not df_country_errors.empty:
-            df_country_errors["iso_alpha"] = df_country_errors["country"].apply(get_country_iso_alpha3)
+
+            df_country_errors["iso_alpha"] = df_country_errors["country"].apply(
+                get_country_iso_alpha3
+            )
             df_country_errors = df_country_errors.dropna(subset=["iso_alpha"])
-            fig_errors = px.choropleth(df_country_errors, locations="iso_alpha", color="error_rate", hover_name="country",
-                                       color_continuous_scale=px.colors.sequential.Reds, title="Процент ошибок (%)")
-            st.plotly_chart(fig_errors, use_container_width=True)
 
-    st.subheader("Сводная таблица по странам и ошибкам")
+            if not df_country_errors.empty:
+                fig_errors = px.choropleth(
+                    df_country_errors,
+                    locations="iso_alpha",
+                    color="error_rate",
+                    hover_name="country",
+                    color_continuous_scale=px.colors.sequential.Reds,
+                    title="Процент ошибок (%)",
+                )
+                st.plotly_chart(fig_errors, use_container_width=True)
+
+        else:
+            st.info("Нет данных об ошибках по странам для выбранных фильтров.")
+
+    st.subheader("Таблица с гео-данными и ошибками")
+
     if not df_country_errors.empty:
-        st.dataframe(df_country_errors[['country', 'total_count', 'error_count', 'error_rate']].sort_values('error_rate', ascending=False), use_container_width=True)
+        st.dataframe(
+            df_country_errors[
+                ["country", "total_count", "error_count", "error_rate"]
+            ].sort_values("error_rate", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
-# --- ВКЛАДКА 3: Топ-листы и статусы ---
 with tab3:
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Топ 10 страниц по запросам")
-        # JOIN Fact с Dim IP для фильтрации по стране, если она выбрана
-        pages_query = f"""
-        SELECT page, count() AS hits 
-        FROM fact_nginx_requests AS T1
-        {where_sql.replace("WHERE", "WHERE T1.log_type = 'access' AND " if "WHERE" in where_sql else "WHERE T1.log_type = 'access' AND ")}
-        GROUP BY page ORDER BY hits DESC LIMIT 10
-        """
-        pages_df = run_query(CLIENT, pages_query)
+
+        pages_df = run_query(
+            CLIENT,
+            f"SELECT req.page AS page, count() AS hits {FROM_SQL} {access_where_sql} GROUP BY req.page ORDER BY hits DESC LIMIT 10",
+        )
         st.dataframe(pages_df, use_container_width=True)
 
         st.subheader("Топ 10 IP по объему трафика (MB)")
-        # JOIN Fact с Dim IP для получения IP адреса
-        ip_traffic_query = f"""
-        SELECT 
-            T2.ip, 
-            sum(T1.bytes) / 1024 / 1024 as total_mb 
-        FROM fact_nginx_requests AS T1
-        INNER JOIN dim_ip AS T2 ON T1.ip_key = T2.ip_id
-        {where_sql.replace("WHERE", "WHERE T1.log_type = 'access' AND " if "WHERE" in where_sql else "WHERE T1.log_type = 'access' AND ")}
-        GROUP BY T2.ip ORDER BY total_mb DESC LIMIT 10
-        """
-        ip_traffic_df = run_query(CLIENT, ip_traffic_query)
+
+        ip_traffic_df = run_query(
+            CLIENT,
+            f"SELECT ip.ip AS ip, sum(f.bytes) / 1024 / 1024 as total_mb {FROM_SQL} {access_where_sql} GROUP BY ip.ip ORDER BY total_mb DESC LIMIT 10",
+        )
         if not ip_traffic_df.empty:
-            st.bar_chart(ip_traffic_df.set_index('ip'))
+            st.bar_chart(ip_traffic_df.set_index("ip"))
 
     with col2:
         st.subheader("Распределение по статусам")
-        status_query = f"SELECT status, count() AS cnt FROM fact_nginx_requests {where_sql} AND log_type = 'access' GROUP BY status ORDER BY status"
-        status_df = run_query(CLIENT, status_query)
+
+        status_df = run_query(
+            CLIENT,
+            f"SELECT f.status AS status, count() AS cnt {FROM_SQL} {access_where_sql} GROUP BY f.status ORDER BY f.status",
+        )
         if not status_df.empty:
-            fig = px.pie(status_df, names="status", values="cnt", title="Статусы ответов")
+            fig = px.pie(
+                status_df, names="status", values="cnt", title="Статусы ответов"
+            )
             st.plotly_chart(fig, use_container_width=True)
 
         st.subheader("Топ 10 IP по ошибкам")
-        # JOIN Fact с Dim IP
-        ip_errors_query = f"""
-        SELECT 
-            T2.ip, 
-            count() as errors 
-        FROM fact_nginx_requests AS T1
-        INNER JOIN dim_ip AS T2 ON T1.ip_key = T2.ip_id
-        {where_sql.replace("WHERE", "WHERE T1.log_type = 'access' AND T1.status >= 400 AND " if "WHERE" in where_sql else "WHERE T1.log_type = 'access' AND T1.status >= 400 AND ")}
-        GROUP BY T2.ip ORDER BY errors DESC LIMIT 10
-        """
-        ip_errors_df = run_query(CLIENT, ip_errors_query)
+        error_ip_where_clauses = ["f.status >= 400"] + access_where_clauses[1:]
+        error_ip_where_sql = "WHERE " + " AND ".join(error_ip_where_clauses)
+
+        ip_errors_df = run_query(
+            CLIENT,
+            f"SELECT ip.ip AS ip, count() as errors {FROM_SQL} {error_ip_where_sql} GROUP BY ip.ip ORDER BY errors DESC LIMIT 10",
+        )
         st.dataframe(ip_errors_df, use_container_width=True)
 
     st.subheader("Тепловая карта ошибок: Страница vs Статус")
-    # JOIN Fact с Dim IP (для фильтрации по стране, если выбрана) и DIM Anomaly
+
     heatmap_query = f"""
-    SELECT T1.page, T1.status, count() as count
-    FROM fact_nginx_requests AS T1
-    -- JOIN с Dim IP, чтобы применить фильтры по стране
-    INNER JOIN dim_ip AS T2 ON T1.ip_key = T2.ip_id 
-    {where_sql.replace("WHERE", "WHERE T1.log_type = 'access' AND T1.status >= 400 AND " if "WHERE" in where_sql else "WHERE T1.log_type = 'access' AND T1.status >= 400 AND ")}
-    AND T1.page IN (
-        SELECT page FROM fact_nginx_requests AS T_inner
-        {where_sql.replace("WHERE", "WHERE T_inner.log_type = 'access' AND " if "WHERE" in where_sql else "WHERE T_inner.log_type = 'access' AND ")}
-        GROUP BY page ORDER BY count() DESC LIMIT 15
-    )
-    GROUP BY T1.page, T1.status
+    SELECT req.page AS page, f.status AS status, count() as count
+    {FROM_SQL}
+    {where_sql}
+    AND req.page IN (SELECT req.page FROM fact_nginx_events f LEFT JOIN dim_request req ON f.request_id = req.request_id {where_sql} GROUP BY req.page ORDER BY count() DESC LIMIT 15)
+    AND f.status >= 400
+    GROUP BY req.page, f.status
     """
+
     heatmap_df = run_query(CLIENT, heatmap_query)
     if not heatmap_df.empty:
-        heatmap_pivot = heatmap_df.pivot_table(index='page', columns='status', values='count').fillna(0)
-        fig_heatmap = px.imshow(heatmap_pivot, text_auto=True, aspect="auto",
-                                color_continuous_scale='Reds',
-                                labels=dict(x="HTTP Статус", y="Страница", color="Кол-во ошибок"))
+        heatmap_pivot = heatmap_df.pivot_table(
+            index="page", columns="status", values="count"
+        ).fillna(0)
+        fig_heatmap = px.imshow(
+            heatmap_pivot,
+            text_auto=True,
+            aspect="auto",
+            color_continuous_scale="Reds",
+            labels=dict(x="HTTP Статус", y="Страница", color="Кол-во ошибок"),
+        )
         st.plotly_chart(fig_heatmap, use_container_width=True)
 
-# --- ВКЛАДКА 4: Детекция аномалий ---
+
 with tab4:
     st.subheader("Обнаруженные аномалии")
-    # Фильтр по временному диапазону и аномалиям
-    anomaly_where = f"WHERE T1.time_key BETWEEN toDateTime('{start_time}') AND toDateTime('{end_time}')"
+    anomaly_where = f"WHERE f.timestamp BETWEEN toDateTime('{start_time}') AND toDateTime('{end_time}') AND f.is_anomaly = 1"
 
-    col1, col2 = st.columns([2,1])
+    col1, col2 = st.columns([2, 1])
     with col1:
         st.subheader("Временная шкала аномалий (Timeline)")
-        # JOIN Fact с Dim Anomaly и Dim IP
+
         anomaly_timeline_query = f"""
-        SELECT 
-            T1.time_key as timestamp, 
-            T3.ip, 
-            T2.anomaly_type
-        FROM fact_nginx_requests AS T1
-        INNER JOIN dim_anomaly_type AS T2 ON T1.anomaly_type_key = T2.anomaly_type_id
-        INNER JOIN dim_ip AS T3 ON T1.ip_key = T3.ip_id
-        {anomaly_where} AND T1.is_anomaly = 1 AND T2.anomaly_type != 'NoAnomaly' 
-        ORDER BY timestamp DESC LIMIT 500
+        SELECT
+            f.timestamp AS timestamp,
+            ip.ip AS ip,
+            at.anomaly_type AS anomaly_type
+        {FROM_SQL} {anomaly_where} AND at.anomaly_type != ''
+        ORDER BY f.timestamp DESC LIMIT 500
         """
         df_anomalies_timeline = run_query(CLIENT, anomaly_timeline_query)
         if not df_anomalies_timeline.empty:
-            fig_timeline = px.scatter(df_anomalies_timeline, x='timestamp', y='ip', color='anomaly_type',
-                                      title="Временная шкала аномальной активности",
-                                      labels={"timestamp": "Время", "ip": "IP адрес атакующего", "anomaly_type": "Тип аномалии"})
+
+            fig_timeline = px.scatter(
+                df_anomalies_timeline,
+                x="timestamp",
+                y="ip",
+                color="anomaly_type",
+                title="Временная шкала аномальной активности",
+                labels={
+                    "timestamp": "Время",
+                    "ip": "IP адрес атакующего",
+                    "anomaly_type": "Тип аномалии",
+                },
+            )
             st.plotly_chart(fig_timeline, use_container_width=True)
         else:
             st.info("Аномальная активность не обнаружена в выбранном диапазоне.")
 
     with col2:
         st.subheader("Распределение по типам аномалий")
-        # Агрегация по Dim Anomaly
+
         anomaly_pie_query = f"""
-        SELECT 
-            T2.anomaly_type, 
-            count() as cnt 
-        FROM fact_nginx_requests AS T1
-        INNER JOIN dim_anomaly_type AS T2 ON T1.anomaly_type_key = T2.anomaly_type_id
-        {anomaly_where} AND T1.is_anomaly = 1 AND T2.anomaly_type != 'NoAnomaly' 
-        GROUP BY T2.anomaly_type
+        SELECT at.anomaly_type AS anomaly_type, count() as cnt
+        {FROM_SQL} {anomaly_where} AND at.anomaly_type != ''
+        GROUP BY at.anomaly_type
         """
         df_anomaly_pie = run_query(CLIENT, anomaly_pie_query)
         if not df_anomaly_pie.empty:
-            fig_pie = px.pie(df_anomaly_pie, names='anomaly_type', values='cnt')
+            fig_pie = px.pie(df_anomaly_pie, names="anomaly_type", values="cnt")
             st.plotly_chart(fig_pie, use_container_width=True)
 
     st.subheader("Сводная таблица по аномалиям")
-    # JOIN Fact с Dim IP и Dim Anomaly
+
     anomaly_table_query = f"""
-    SELECT 
-        T3.ip, 
-        T3.country, 
-        T2.anomaly_type, 
-        max(T1.time_key) as last_seen, 
-        count() as request_count 
-    FROM fact_nginx_requests AS T1
-    INNER JOIN dim_anomaly_type AS T2 ON T1.anomaly_type_key = T2.anomaly_type_id
-    INNER JOIN dim_ip AS T3 ON T1.ip_key = T3.ip_id
-    {anomaly_where} AND T1.is_anomaly = 1 AND T2.anomaly_type != 'NoAnomaly' 
-    GROUP BY T3.ip, T3.country, T2.anomaly_type 
+    SELECT
+        ip.ip AS ip,
+        ip.country AS country,
+        at.anomaly_type AS anomaly_type,
+        max(f.timestamp) as last_seen,
+        count() as request_count
+    {FROM_SQL} {anomaly_where} AND at.anomaly_type != ''
+    GROUP BY ip.ip, ip.country, at.anomaly_type
     ORDER BY last_seen DESC LIMIT 20
     """
     df_anomalies_table = run_query(CLIENT, anomaly_table_query)
     if not df_anomalies_table.empty:
         st.dataframe(df_anomalies_table, use_container_width=True)
 
-# --- ВКЛАДКА 5: Анализ ошибок сервера ---
+
 with tab5:
     st.subheader("Анализ логов ошибок")
-    # Фильтрация по логам ошибок
-    error_where = f"WHERE log_type = 'error' AND time_key BETWEEN toDateTime('{start_time}') AND toDateTime('{end_time}')"
-    
+    error_where = f"WHERE f.log_type = 'error' AND f.timestamp BETWEEN toDateTime('{start_time}') AND toDateTime('{end_time}')"
+
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Топ 10 сообщений об ошибках")
-        # Агрегация по полю error_message в Fact Table
-        top_errors_query = f"SELECT error_message, count() as cnt FROM fact_nginx_requests {error_where} GROUP BY error_message ORDER BY cnt DESC LIMIT 10"
+
+        top_errors_query = f"""
+        SELECT ed.error_message AS error_message, count() as cnt
+        {FROM_SQL} {error_where}
+        GROUP BY ed.error_message ORDER BY cnt DESC LIMIT 10
+        """
         df_top_errors = run_query(CLIENT, top_errors_query)
         if not df_top_errors.empty:
-            fig_top_errors = px.bar(df_top_errors, x='cnt', y='error_message', orientation='h', title="Самые частые ошибки")
+            fig_top_errors = px.bar(
+                df_top_errors,
+                x="cnt",
+                y="error_message",
+                orientation="h",
+                title="Самые частые ошибки",
+            )
             st.plotly_chart(fig_top_errors, use_container_width=True)
 
     with col2:
-        st.subheader("Динамика ошибок по уровням (error/warn) - **Требует DIM_ANOMALY**")
-        # Для простоты, используем error_message как прокси
+
+        st.subheader("Динамика ошибок по уровням (error/warn)")
         error_level_query = f"""
         SELECT
-            toStartOfMinute(time_key) as minute,
-            countIf(error_message LIKE '%error%') as errors, 
-            countIf(error_message LIKE '%warn%') as warnings
-        FROM fact_nginx_requests {error_where}
+            toStartOfMinute(f.timestamp) as minute,
+            countIf(ed.log_level = 'error') as errors,
+            countIf(ed.log_level = 'warn') as warnings
+        {FROM_SQL} {error_where}
         GROUP BY minute ORDER BY minute
         """
         df_error_level = run_query(CLIENT, error_level_query)
-        if not df_error_level.empty and (df_error_level['errors'].sum() > 0 or df_error_level['warnings'].sum() > 0):
-            st.line_chart(df_error_level.set_index('minute'))
+        if not df_error_level.empty and (
+            df_error_level["errors"].sum() > 0 or df_error_level["warnings"].sum() > 0
+        ):
+            st.line_chart(df_error_level.set_index("minute"))
 
     st.subheader("Последние 100 ошибок сервера")
-    # JOIN Fact с Dim IP
-    df_errors_table = run_query(CLIENT, f"""
-        SELECT 
-            T1.time_key as timestamp, 
-            T2.ip, 
-            T2.country, 
-            T1.log_level, -- Это поле Nullable в Fact Table
-            T1.error_message 
-        FROM fact_nginx_requests AS T1
-        INNER JOIN dim_ip AS T2 ON T1.ip_key = T2.ip_id
-        {error_where} 
-        ORDER BY timestamp DESC LIMIT 100
-    """)
+
+    errors_table_query = f"""
+    SELECT
+        f.timestamp AS timestamp,
+        ip.ip AS ip,
+        ip.country AS country,
+        ed.log_level AS log_level,
+        ed.error_message AS error_message
+    {FROM_SQL} {error_where}
+    ORDER BY f.timestamp DESC LIMIT 100
+    """
+    df_errors_table = run_query(CLIENT, errors_table_query)
     if not df_errors_table.empty:
         st.dataframe(df_errors_table, use_container_width=True)
     else:
         st.info("Ошибки сервера не найдены в выбранном диапазоне.")
-        
+
+
 with tab6:
     st.subheader("Прогноз нагрузки на сервер (запросов в час)")
-    
-    # 1. Загружаем фактические данные за последние 3 дня
+
     actuals_query = """
-    SELECT 
-        toStartOfHour(time_key) as hour, 
-        count() as actual_requests
-    FROM fact_nginx_requests
-    WHERE log_type = 'access' AND time_key >= now() - INTERVAL 3 DAY
+    SELECT toStartOfHour(timestamp) as hour, count() as actual_requests
+    FROM fact_nginx_events
+    WHERE log_type = 'access' AND timestamp >= now() - INTERVAL 3 DAY
     GROUP BY hour ORDER BY hour
     """
     df_actuals = run_query(CLIENT, actuals_query)
-    
-    # 2. Загружаем прогнозные данные (таблица осталась прежней)
+
     predictions_query = "SELECT timestamp as hour, predicted_requests, predicted_lower, predicted_upper FROM nginx_predictions ORDER BY hour"
     df_predictions = run_query(CLIENT, predictions_query)
 
     if not df_actuals.empty and not df_predictions.empty:
-        # --- Блок предписывающей аналитики ---
-        CRITICAL_LOAD_THRESHOLD = df_actuals['actual_requests'].quantile(0.95) # Порог = 95-й перцентиль исторической нагрузки
-        
-        future_predictions = df_predictions[df_predictions['hour'] > datetime.now()]
-        
+
+        CRITICAL_LOAD_THRESHOLD = df_actuals["actual_requests"].quantile(0.95)
+
+        future_predictions = df_predictions[df_predictions["hour"] > datetime.now()]
         if not future_predictions.empty:
-            peak_prediction = future_predictions.sort_values('predicted_upper', ascending=False).iloc[0]
 
-            st.info(f"**Прогноз:** Ожидается пиковая нагрузка **~{int(peak_prediction['predicted_requests'])}** запросов/час в **{peak_prediction['hour'].strftime('%Y-%m-%d %H:%M')}**.")
+            peak_prediction = future_predictions.sort_values(
+                "predicted_upper", ascending=False
+            ).iloc[0]
 
-            if peak_prediction['predicted_upper'] > CRITICAL_LOAD_THRESHOLD:
+            st.info(
+                f"**Прогноз:** Ожидается пиковая нагрузка **~{int(peak_prediction['predicted_requests'])}** запросов/час в **{peak_prediction['hour'].strftime('%Y-%m-%d %H:%M')}**."
+            )
+
+            if peak_prediction["predicted_upper"] > CRITICAL_LOAD_THRESHOLD:
                 st.error(
                     f"""
                     **⚠️ РЕКОМЕНДАЦИЯ (Предписывающая аналитика):**
@@ -879,41 +957,38 @@ with tab6:
                     """
                 )
 
-            # --- Визуализация ---
-            # Преобразуем для Altair
-            df_actuals['type'] = 'Фактические данные'
-            df_actuals.rename(columns={'actual_requests': 'requests'}, inplace=True)
-            
-            df_pred_main = df_predictions[['hour', 'predicted_requests']].copy()
-            df_pred_main['type'] = 'Прогноз'
-            df_pred_main.rename(columns={'predicted_requests': 'requests'}, inplace=True)
+            df_actuals["type"] = "Фактические данные"
+            df_actuals.rename(columns={"actual_requests": "requests"}, inplace=True)
 
-            # Соединяем для основного графика
-            source = pd.concat([df_actuals[['hour', 'requests', 'type']], df_pred_main])
-
-            # Основной график
-            line = alt.Chart(source).mark_line().encode(
-                x='hour:T',
-                y='requests:Q',
-                color='type:N'
-            ).properties(
-                 title='Сравнение фактической нагрузки и прогноза'
+            df_pred_main = df_predictions[["hour", "predicted_requests"]].copy()
+            df_pred_main["type"] = "Прогноз"
+            df_pred_main.rename(
+                columns={"predicted_requests": "requests"}, inplace=True
             )
 
-            # Область неопределенности для прогноза
-            band = alt.Chart(df_predictions).mark_area(opacity=0.3).encode(
-                x='hour:T',
-                y='predicted_lower:Q',
-                y2='predicted_upper:Q'
-            ).properties(
-                title='Доверительный интервал прогноза'
+            source = pd.concat([df_actuals[["hour", "requests", "type"]], df_pred_main])
+            line = (
+                alt.Chart(source)
+                .mark_line()
+                .encode(x="hour:T", y="requests:Q", color="type:N")
+                .properties(title="Сравнение фактической нагрузки и прогноза")
             )
-            
+
+            band = (
+                alt.Chart(df_predictions)
+                .mark_area(opacity=0.3)
+                .encode(x="hour:T", y="predicted_lower:Q", y2="predicted_upper:Q")
+                .properties(title="Доверительный интервал прогноза")
+            )
+
             st.altair_chart((band + line).interactive(), use_container_width=True)
         else:
             st.warning("Нет будущих прогнозов для отображения.")
     else:
-        st.warning("Нет данных для построения прогноза. Сначала необходимо запустить скрипты обучения и генерации прогнозов.")
+        st.warning(
+            "Нет данных для построения прогноза. Сначала необходимо запустить скрипты обучения и генерации прогнозов."
+        )
+
 ```
 
 ### streamlit/Dockerfile
@@ -990,7 +1065,6 @@ print("--- Генерация прогнозов завершена ---")
 ### spark/spark_processor.py
 
 ```
-# spark/spark_processor.py
 import time
 import geoip2.database
 from kafka.admin import KafkaAdminClient, NewTopic
@@ -1007,89 +1081,117 @@ from pyspark.sql.functions import (
     regexp_extract,
     to_timestamp,
     split,
-    greatest,
     coalesce,
-    hash, 
-    date_trunc 
+    xxhash64,
 )
-from pyspark.sql.types import StringType, StructField, StructType, IntegerType
+from pyspark.sql.types import StringType, StructType, StructField, IntegerType
+import time
+from pyspark.sql.utils import AnalysisException
 
 KAFKA_BROKER = "kafka:9092"
 TOPIC = "nginx_logs"
-CHECKPOINT_DIR = "/tmp/spark_checkpoints_nginx_v3" # ИЗМЕНЕНО: Новый путь для сброса состояния
-INIT_SCRIPT_EXECUTED = False # Флаг для однократного выполнения инициализации DIM
+CHECKPOINT_DIR = "/tmp/spark_checkpoints_nginx"
+CLICKHOUSE_URL = "jdbc:clickhouse://clickhouse:8123/default"
+CLICKHOUSE_TABLE = "fact_nginx_events"
+GEO_DB_PATH = "/opt/spark-apps/GeoLite2-Country.mmdb"
 
-# Поведенческие пороги
+# Behavioral thresholds
 REQUEST_RATE_THRESHOLD = 20
 LOGIN_ATTACK_THRESHOLD = 10
 SCANNING_THRESHOLD = 15
 
-# Регулярные выражения для сигнатурных атак
+# Signature-based attack patterns
 SQLI_PATTERN = r"('|%27|--|%2D%2D|union|%75%6E%69%6F%6E)"
 PATH_TRAVERSAL_PATTERN = r"(\.\./|%2E%2E%2F)"
 VULN_SCAN_PATTERN = r"(wp-admin|phpmyadmin|/.git|/solr)"
 BAD_AGENT_PATTERN = r"(sqlmap|nikto|nmap|masscan)"
 
-CLICKHOUSE_URL = "jdbc:clickhouse://clickhouse:8123/default"
-CLICKHOUSE_FACT_TABLE = "fact_nginx_requests"
-CLICKHOUSE_DIM_IP = "dim_ip"
-CLICKHOUSE_DIM_ANOMALY = "dim_anomaly_type"
-GEO_DB_PATH = "/opt/spark-apps/GeoLite2-Country.mmdb"
 
 def ensure_topic():
     for i in range(10):
         try:
-            admin = KafkaAdminClient(bootstrap_servers=KAFKA_BROKER, client_id="spark-topic-checker")
+            admin = KafkaAdminClient(
+                bootstrap_servers=KAFKA_BROKER, client_id="spark-topic-checker"
+            )
             topic_list = [NewTopic(name=TOPIC, num_partitions=1, replication_factor=1)]
             admin.create_topics(new_topics=topic_list, validate_only=False)
-            print(f"✅ Kafka topic '{TOPIC}' создан.")
+            print(f"✅ Kafka topic '{TOPIC}' created.")
             admin.close()
             return
         except TopicAlreadyExistsError:
-            print(f"ℹ️ Kafka topic '{TOPIC}' уже существует.")
+            print(f"ℹ️ Kafka topic '{TOPIC}' already exists.")
             admin.close()
             return
         except Exception as e:
-            print(f"⚠️ Kafka пока не готов ({e}), ждём...")
+            print(f"⚠️ Kafka is not ready yet ({e}), waiting...")
             time.sleep(5)
-    print("❌ Не удалось создать Kafka-топик. Проверь kafka logs.")
+    print("❌ Could not create Kafka topic. Check Kafka logs.")
+
 
 ensure_topic()
 
-spark = SparkSession.builder.appName("NginxLogProcessorStarSchema").config("spark.sql.streaming.checkpointLocation", CHECKPOINT_DIR).getOrCreate()
+spark = (
+    SparkSession.builder.appName("NginxLogProcessor")
+    .config("spark.sql.streaming.checkpointLocation", CHECKPOINT_DIR)
+    .getOrCreate()
+)
+
 
 @udf(StringType())
 def get_country_from_ip(ip):
     try:
+        if ip is None or str(ip).strip() == "":
+            return "Unknown"
         with geoip2.database.Reader(GEO_DB_PATH) as reader:
-            response = reader.country(ip)
-            return response.country.name
+            resp = reader.country(ip)
+            return resp.country.name or "Unknown"
     except (geoip2.errors.AddressNotFoundError, ValueError):
         return "Unknown"
     except Exception:
         return "Error"
 
-kafka_schema = StructType([StructField("message", StringType()), StructField("log_type", StringType())])
-df = spark.readStream.format("kafka").option("kafka.bootstrap.servers", KAFKA_BROKER).option("subscribe", TOPIC).option("startingOffsets", "earliest").load()
-json_df = df.select(from_json(col("value").cast("string"), kafka_schema).alias("data")).select("data.*")
 
-access_pattern = r'(\S+) - - \[(.*?)\] "(\S+)\s*(\S*)\s*(\S*)" (\d{3}) (\d+) "(.*?)" "(.*?)"'
+
+kafka_schema = StructType(
+    [StructField("message", StringType()), StructField("log_type", StringType())]
+)
+df = (
+    spark.readStream.format("kafka")
+    .option("kafka.bootstrap.servers", KAFKA_BROKER)
+    .option("subscribe", TOPIC)
+    .option("startingOffsets", "earliest")
+    .load()
+)
+json_df = df.select(
+    from_json(col("value").cast("string"), kafka_schema).alias("data")
+).select("data.*")
+
+access_pattern = (
+    r'(\S+) - - \[(.*?)\] "(\S+)\s*(\S*)\s*(\S*)" (\d{3}) (\d+) "(.*?)" "(.*?)"'
+)
 error_pattern = r'(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) \[(\w+)\] .*? client: (\S+), server: .*?, request: ".*?", (.*?), host: ".*?"'
 
-access_logs = json_df.filter(col("log_type") == "access").select(
-    regexp_extract("message", access_pattern, 1).alias("ip"),
-    regexp_extract("message", access_pattern, 2).alias("time"),
-    regexp_extract("message", access_pattern, 3).alias("method"),
-    regexp_extract("message", access_pattern, 4).alias("page"),
-    regexp_extract("message", access_pattern, 6).alias("status"),
-    regexp_extract("message", access_pattern, 7).alias("bytes"),
-    regexp_extract("message", access_pattern, 8).alias("referrer"),
-    regexp_extract("message", access_pattern, 9).alias("agent"),
-    lit("access").alias("log_type"),
-).withColumn("request", col("page")).withColumn("timestamp", to_timestamp(col("time"), "dd/MMM/yyyy:HH:mm:ss Z")).withColumn("status", col("status").cast(IntegerType())).withColumn("bytes", col("bytes").cast(IntegerType())).withColumn("error_message", lit(None).cast(StringType())).withColumn("log_level", lit(None).cast(StringType())).drop("time")
-
-# ИСПРАВЛЕНО: Упрощенная и более надежная логика для IP в логах ошибок
-# В spark_processor.py, замените старый блок error_logs:
+access_logs = (
+    json_df.filter(col("log_type") == "access")
+    .select(
+        regexp_extract("message", access_pattern, 1).alias("ip"),
+        regexp_extract("message", access_pattern, 2).alias("time"),
+        regexp_extract("message", access_pattern, 3).alias("method"),
+        regexp_extract("message", access_pattern, 4).alias("page"),
+        regexp_extract("message", access_pattern, 6).alias("status"),
+        regexp_extract("message", access_pattern, 7).alias("bytes"),
+        regexp_extract("message", access_pattern, 8).alias("referrer"),
+        regexp_extract("message", access_pattern, 9).alias("agent"),
+        lit("access").alias("log_type"),
+    )
+    .withColumn("request", col("page"))
+    .withColumn("timestamp", to_timestamp(col("time"), "dd/MMM/yyyy:HH:mm:ss Z"))
+    .withColumn("status", col("status").cast(IntegerType()))
+    .withColumn("bytes", col("bytes").cast(IntegerType()))
+    .withColumn("error_message", lit(None).cast(StringType()))
+    .withColumn("log_level", lit(None).cast(StringType()))
+    .drop("time")
+)
 error_logs = (
     json_df.filter(col("log_type") == "error")
     .select(
@@ -1099,8 +1201,7 @@ error_logs = (
         regexp_extract("message", error_pattern, 4).alias("error_message"),
         lit("error").alias("log_type"),
     )
-    .withColumn("ip", regexp_extract(col("ip_raw"), r'^(\S+)', 1))
-    .withColumn("ip", when(col("ip") != "", col("ip")).otherwise(lit("0.0.0.0")))
+    .withColumn("ip", split(col("ip_raw"), ",")[0])
     .withColumn("timestamp", to_timestamp(col("time"), "yyyy/MM/dd HH:mm:ss"))
     .select(
         "timestamp",
@@ -1111,120 +1212,179 @@ error_logs = (
         lit(None).cast(StringType()).alias("request"),
         lit(None).cast(StringType()).alias("method"),
         lit(None).cast(StringType()).alias("page"),
-        lit(0).cast(IntegerType()).alias("status"),
-        lit(0).cast(IntegerType()).alias("bytes"),
+        lit(None).cast(IntegerType()).alias("status"),
+        lit(None).cast(IntegerType()).alias("bytes"),
         lit(None).cast(StringType()).alias("referrer"),
         lit(None).cast(StringType()).alias("agent"),
     )
 )
-
-
 unified_df = access_logs.unionByName(error_logs).filter(col("ip") != "")
+
+
+def write_dim_table(df, table_name, retries=3, delay=2):
+    for i in range(retries):
+        try:
+            (
+                df.write.format("jdbc")
+                .option("url", CLICKHOUSE_URL)
+                .option("driver", "com.clickhouse.jdbc.ClickHouseDriver")
+                .option("dbtable", table_name)
+                .option("user", "default")
+                .option("password", "")
+                .mode("append")
+                .save()
+            )
+            return
+        except Exception as e:
+            print(f"Write to {table_name} failed (attempt {i+1}/{retries}): {e}")
+            if i + 1 == retries:
+                raise
+            time.sleep(delay)
 
 
 def write_to_clickhouse(batch_df, batch_id):
     if batch_df.rdd.isEmpty():
-        print(f"⚠️ Пустой batch {batch_id}, пропущен.")
+        print(f"⚠️ Empty batch {batch_id}, skipping.")
         return
 
-    print(f"--- Processing Batch {batch_id} (Star Schema ETL) ---")
+    print(f"--- Processing Batch {batch_id} ---")
     batch_df.cache()
 
-    # --- 1. Подготовка Данных для DIMENSION (IP/Geo) ---
-    dim_ip_df = (
-        batch_df.filter(col("ip").isNotNull())
-        .select(
-            col("ip"), 
-            get_country_from_ip(col("ip")).alias("country"),
-            hash(col("ip")).alias("ip_id")
-        )
-        .distinct()
-    )
-    
-    # Заполняем пропущенные страны
-    dim_ip_df = dim_ip_df.na.fill({'country': 'Unknown'})
-    
-    # ИСПРАВЛЕНИЕ (ФИНАЛЬНОЕ): Явно перевыбираем ВСЕ 3 столбца в нужном порядке перед записью. 
-    # Это должно предотвратить потерю ip_id после .na.fill()
-    dim_ip_df = dim_ip_df.select("ip", "country", "ip_id") 
-    
-    # Вставляем/Обновляем в dim_ip (используя ReplacingMergeTree)
-    (
-        dim_ip_df.write.format("jdbc")
-        .option("url", CLICKHOUSE_URL)
-        .option("driver", "com.clickhouse.jdbc.ClickHouseDriver")
-        .option("dbtable", CLICKHOUSE_DIM_IP)
-        .option("user", "default").option("password", "")
-        .mode("append")
-        .save()
-    )
-
-    # --- 2. Подготовка Данных для DIMENSION (Anomaly Type) ---
-    # Определение аномалий (только сигнатурные для атомарности факта)
-    enriched_for_dim = batch_df.withColumn("signature_anomaly_type",
+    # STAGE 1: Signature Analysis
+    signature_df = batch_df.withColumn(
+        "signature_anomaly_type",
         when(col("page").rlike(SQLI_PATTERN), "SQL Injection")
         .when(col("page").rlike(PATH_TRAVERSAL_PATTERN), "Path Traversal")
         .when(col("page").rlike(VULN_SCAN_PATTERN), "Vulnerability Scan")
         .when(col("agent").rlike(BAD_AGENT_PATTERN), "Bad User-Agent")
-        .otherwise(lit(None))
-    )
-    
-    dim_anomaly_df = (
-        enriched_for_dim.filter(col("signature_anomaly_type").isNotNull())
-        .select(col("signature_anomaly_type").alias("anomaly_type"), lit(1).cast(IntegerType()).alias("is_anomaly"))
-        .distinct()
-    )
-    # Вставляем/Обновляем в dim_anomaly_type
-    (
-        dim_anomaly_df.write.format("jdbc")
-        .option("url", CLICKHOUSE_URL)
-        .option("driver", "com.clickhouse.jdbc.ClickHouseDriver")
-        .option("dbtable", CLICKHOUSE_DIM_ANOMALY)
-        .option("user", "default").option("password", "")
-        .mode("append")
-        .save()
+        .otherwise(lit(None)),
     )
 
-    # --- 3. Обогащение и вставка в FACT Table ---
-    
-    final_fact_df = (
-        enriched_for_dim
-        .withColumn("anomaly_type", coalesce(col("signature_anomaly_type"), lit("NoAnomaly")))
-        .withColumn("is_anomaly", when(col("anomaly_type") != "NoAnomaly", 1).otherwise(0))
-        .withColumn("country", get_country_from_ip(col("ip"))) # Страна нужна только для DIM, но оставим для отладки
-        .withColumn("time_key", date_trunc("hour", col("timestamp"))) # Ключ времени
-        .withColumn("ip_key", hash(col("ip"))) # Ключ IP (хэш от IP)
-        .withColumn("anomaly_type_key", hash(col("anomaly_type"), col("is_anomaly")) % 255) # Вычисляем хэш напрямую
-        .withColumn("log_type", coalesce(col("log_type"), lit("unknown")))
+    # STAGE 2: Behavioral Analysis
+    behavioral_df = (
+        batch_df.filter(col("log_type") == "access")
+        .groupBy("ip")
+        .agg(
+            count("*").alias("request_count"),
+            countDistinct("page").alias("distinct_pages"),
+            count(when((col("page") == "/login") & (col("method") == "POST"), 1)).alias(
+                "login_posts"
+            ),
+        )
+        .withColumn(
+            "behavioral_anomaly_type",
+            when(col("login_posts") > LOGIN_ATTACK_THRESHOLD, "Login Attack")
+            .when(col("distinct_pages") > SCANNING_THRESHOLD, "Scanning Activity")
+            .when(col("request_count") > REQUEST_RATE_THRESHOLD, "Request Rate Anomaly")
+            .otherwise(lit(None)),
+        )
     )
     
+    print("==== batch schema ====")
+    batch_df.printSchema()
+    batch_df.show(5, truncate=False)
+    
+    base_df = (
+        signature_df.join(behavioral_df, "ip", "left")
+        # объединяем сигнатуры и поведение
+        .withColumn(
+            "anomaly_type",
+            coalesce(col("signature_anomaly_type"), col("behavioral_anomaly_type")),
+        ).withColumn(
+            "is_anomaly",
+            when(col("anomaly_type").isNotNull(), lit(1)).otherwise(lit(0)),
+        )
+        # создаём country прямо здесь из ip — так мы точно гарантируем её наличие в схеме
+        .withColumn("country", coalesce(get_country_from_ip(col("ip")), lit("Unknown")))
+        # если нужно, обеспечим пустую строку для anomaly_type
+        .withColumn("anomaly_type", coalesce(col("anomaly_type"), lit("")))
+    )
+
+    # STAGE 4: Extract and write dimensions
+    dim_ip_df = (
+        base_df.select("ip", "country")
+        .distinct()
+        .withColumn("country", coalesce(col("country"), lit("Unknown")))
+        .withColumn("ip_id", xxhash64(col("ip")))
+    )
+    write_dim_table(dim_ip_df, "dim_ip")
+
+    dim_request_df = (
+        base_df.select("request", "method", "page", "referrer")
+        .distinct()
+        .withColumn("request_id", xxhash64("request", "method", "page", "referrer"))
+    )
+    write_dim_table(dim_request_df, "dim_request")
+
+    dim_agent_df = (
+        base_df.select("agent").distinct().withColumn("agent_id", xxhash64("agent"))
+    )
+    write_dim_table(dim_agent_df, "dim_user_agent")
+
+    dim_error_df = (
+        base_df.filter(col("log_type") == "error")
+        .select("log_level", "error_message")
+        .distinct()
+        .withColumn("error_details_id", xxhash64("log_level", "error_message"))
+    )
+    if not dim_error_df.rdd.isEmpty():
+        write_dim_table(dim_error_df, "dim_error_details")
+
+    dim_anomaly_df = (
+        base_df.filter(col("is_anomaly") == 1)
+        .select("anomaly_type")
+        .distinct()
+        .withColumn("anomaly_type_id", xxhash64("anomaly_type"))
+    )
+    if not dim_anomaly_df.rdd.isEmpty():
+        write_dim_table(dim_anomaly_df, "dim_anomaly_type")
+
+    # STAGE 5: Join dimension IDs back to create the fact table
+    fact_df = (
+        base_df.join(dim_ip_df, ["ip", "country"], "left")
+        .join(dim_request_df, ["request", "method", "page", "referrer"], "left")
+        .join(dim_agent_df, "agent", "left")
+        .join(dim_error_df, ["log_level", "error_message"], "left")
+        .join(dim_anomaly_df, "anomaly_type", "left")
+    )
+
+    # STAGE 6: Write to the fact table
     (
-        final_fact_df.select(
-            col("time_key"),
-            col("ip_key"),
-            col("anomaly_type_key"),
+        fact_df.select(
+            "timestamp",
             "log_type",
-            col("status"),
-            col("bytes"),
-            col("error_message"),
-            col("method"),
-            col("page")
+            "ip_id",
+            "request_id",
+            "agent_id",
+            "error_details_id",
+            "anomaly_type_id",
+            "status",
+            "bytes",
+            "is_anomaly",
         )
         .write.format("jdbc")
         .option("url", CLICKHOUSE_URL)
         .option("driver", "com.clickhouse.jdbc.ClickHouseDriver")
-        .option("dbtable", CLICKHOUSE_FACT_TABLE)
+        .option("dbtable", CLICKHOUSE_TABLE)
         .option("user", "default")
         .option("password", "")
         .mode("append")
         .save()
     )
 
-    print(f"✅ Batch {batch_id} записан в ClickHouse Fact Table. {final_fact_df.count()} строк.")
+    print(f"✅ Batch {batch_id} written to ClickHouse ({fact_df.count()} rows).")
     batch_df.unpersist()
-    
-query = unified_df.writeStream.foreachBatch(write_to_clickhouse).outputMode("append").option("checkpointLocation", CHECKPOINT_DIR).trigger(processingTime="15 seconds").start()
+
+
+query = (
+    unified_df.writeStream.foreachBatch(write_to_clickhouse)
+    .outputMode("append")
+    .option("checkpointLocation", CHECKPOINT_DIR)
+    .trigger(processingTime="15 seconds")
+    .start()
+)
 query.awaitTermination()
+
 ```
 
 ### spark/Dockerfile
@@ -1253,22 +1413,23 @@ import pandas as pd
 from prophet import Prophet
 from clickhouse_driver import Client
 import pickle
-import os  # <-- ДОБАВИТЬ ЭТУ СТРОКУ
+import os
 
 CLICKHOUSE_HOST = 'clickhouse'
-MODEL_DIR = '/opt/spark-apps/model' # <-- ДОБАВИТЬ ЭТУ СТРОКУ
-MODEL_PATH = os.path.join(MODEL_DIR, 'prophet_model.pkl') # <-- ИЗМЕНИТЬ ЭТУ СТРОКУ
+MODEL_DIR = '/opt/spark-apps/model'
+MODEL_PATH = os.path.join(MODEL_DIR, 'prophet_model.pkl')
 
 print("--- Начало обучения модели прогнозирования ---")
 
 # 1. Загрузка исторических данных из ClickHouse
 print(f"Подключение к ClickHouse ({CLICKHOUSE_HOST})...")
 client = Client(host=CLICKHOUSE_HOST)
+# ИЗМЕНЕНИЕ: Запрос к новой таблице фактов
 query = """
-SELECT 
+SELECT
     toStartOfHour(timestamp) as ds,
     count() as y
-FROM nginx_logs
+FROM fact_nginx_events
 WHERE log_type = 'access'
 GROUP BY ds
 ORDER BY ds
@@ -1293,10 +1454,7 @@ print("✅ Модель успешно обучена.")
 # 3. Сохранение модели в файл
 print(f"Сохранение модели в файл: {MODEL_PATH}")
 
-# --- ВОТ ИСПРАВЛЕНИЕ ---
-# Создаем директорию, если она не существует
-os.makedirs(MODEL_DIR, exist_ok=True) # <-- ДОБАВИТЬ ЭТУ СТРОКУ
-# -------------------------
+os.makedirs(MODEL_DIR, exist_ok=True)
 
 with open(MODEL_PATH, 'wb') as f:
     pickle.dump(model, f)

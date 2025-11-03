@@ -56,15 +56,15 @@ services:
     container_name: spark
     user: root
     volumes:
-      - ./spark:/opt/spark-apps  
+      - ./spark:/opt/spark-apps
       - ./spark/ivy:/home/spark/.ivy2
     depends_on:
       - kafka
       - clickhouse
     command: >
-      bash -c "/opt/spark/bin/spark-submit
-      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.1,com.clickhouse:clickhouse-jdbc:0.4.6
-      /opt/spark-apps/spark_processor.py"
+      bash -c "until curl -sS http://clickhouse:8123/ >/dev/null 2>&1; do echo 'waiting clickhouse...'; sleep 2; done;
+      /opt/spark/bin/spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.1,com.clickhouse:clickhouse-jdbc:0.4.6 /opt/spark-apps/spark_processor.py"
+
 
   log_generator:
       image: python:3.11-slim
@@ -72,10 +72,7 @@ services:
       volumes:
         - ./nginx/logs:/var/log/nginx
         - ./generate_logs.py:/app/generate_logs.py
-      # УДАЛИТЬ command, чтобы он использовал CMD/ENTRYPOINT из Dockerfile или просто работал
-      # command: >
-      #   sh -c "pip install faker && python3 /app/generate_logs.py && echo 'Log generation finished.'"
-      command: sh -c "pip install faker && python3 /app/generate_logs.py" # Оставить, чтобы установить faker и запустить скрипт бесконечно
+      command: sh -c "pip install faker && python3 /app/generate_logs.py"
       depends_on:
         - nginx
 

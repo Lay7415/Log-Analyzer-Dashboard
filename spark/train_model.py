@@ -2,22 +2,23 @@ import pandas as pd
 from prophet import Prophet
 from clickhouse_driver import Client
 import pickle
-import os  # <-- ДОБАВИТЬ ЭТУ СТРОКУ
+import os
 
 CLICKHOUSE_HOST = 'clickhouse'
-MODEL_DIR = '/opt/spark-apps/model' # <-- ДОБАВИТЬ ЭТУ СТРОКУ
-MODEL_PATH = os.path.join(MODEL_DIR, 'prophet_model.pkl') # <-- ИЗМЕНИТЬ ЭТУ СТРОКУ
+MODEL_DIR = '/opt/spark-apps/model'
+MODEL_PATH = os.path.join(MODEL_DIR, 'prophet_model.pkl')
 
 print("--- Начало обучения модели прогнозирования ---")
 
 # 1. Загрузка исторических данных из ClickHouse
 print(f"Подключение к ClickHouse ({CLICKHOUSE_HOST})...")
 client = Client(host=CLICKHOUSE_HOST)
+# ИЗМЕНЕНИЕ: Запрос к новой таблице фактов
 query = """
-SELECT 
+SELECT
     toStartOfHour(timestamp) as ds,
     count() as y
-FROM nginx_logs
+FROM fact_nginx_events
 WHERE log_type = 'access'
 GROUP BY ds
 ORDER BY ds
@@ -42,10 +43,7 @@ print("✅ Модель успешно обучена.")
 # 3. Сохранение модели в файл
 print(f"Сохранение модели в файл: {MODEL_PATH}")
 
-# --- ВОТ ИСПРАВЛЕНИЕ ---
-# Создаем директорию, если она не существует
-os.makedirs(MODEL_DIR, exist_ok=True) # <-- ДОБАВИТЬ ЭТУ СТРОКУ
-# -------------------------
+os.makedirs(MODEL_DIR, exist_ok=True)
 
 with open(MODEL_PATH, 'wb') as f:
     pickle.dump(model, f)
