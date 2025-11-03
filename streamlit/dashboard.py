@@ -5,8 +5,9 @@ import plotly.express as px
 import pycountry_convert as pc
 from datetime import datetime, timedelta
 import altair as alt
+import time
 
-
+# st.set_page_config() должна быть первой командой Streamlit
 st.set_page_config(page_title="Log Dashboard", layout="wide")
 
 
@@ -19,7 +20,8 @@ def get_clickhouse_client():
 CLIENT = get_clickhouse_client()
 
 
-@st.cache_data(ttl=60)
+# Уменьшенный TTL кэша для более частого обновления данных из БД
+@st.cache_data(ttl=10)
 def run_query(_client, query):
     """Выполняет запрос к ClickHouse и возвращает DataFrame."""
     try:
@@ -34,7 +36,6 @@ def run_query(_client, query):
 
 
 def get_country_iso_alpha3(country_name):
-
     try:
         return pc.country_name_to_country_alpha3(country_name)
     except:
@@ -49,7 +50,6 @@ min_max_time_df = run_query(
     CLIENT, "SELECT min(timestamp), max(timestamp) FROM fact_nginx_events"
 )
 if not min_max_time_df.empty and min_max_time_df.iloc[0, 0] is not None:
-
     min_dt = min_max_time_df.iloc[0, 0].to_pydatetime()
     max_dt = min_max_time_df.iloc[0, 1].to_pydatetime()
     time_range = st.sidebar.slider(
@@ -134,7 +134,6 @@ SELECT
 """
 kpi_df = run_query(CLIENT, kpi_query)
 if not kpi_df.empty:
-
     kpi_data = kpi_df.iloc[0]
     total_requests, unique_ips, avg_bytes, server_error_rate, client_error_rate = (
         kpi_data.get("total", 0),
@@ -204,7 +203,6 @@ with tab1:
         st.line_chart(df_avg_bytes.set_index("minute"))
 
 with tab2:
-
     col1, col2 = st.columns(2)
 
     with col1:
@@ -224,15 +222,10 @@ with tab2:
         df_country = run_query(CLIENT, country_query)
 
         if not df_country.empty:
-
-            df_country["iso_alpha"] = df_country["country"].apply(
-                get_country_iso_alpha3
-            )
-
+            df_country["iso_alpha"] = df_country["country"].apply(get_country_iso_alpha3)
             df_country = df_country.dropna(subset=["iso_alpha"])
 
             if not df_country.empty:
-
                 fig_requests = px.choropleth(
                     df_country,
                     locations="iso_alpha",
@@ -241,12 +234,9 @@ with tab2:
                     color_continuous_scale=px.colors.sequential.Plasma,
                     title="Количество запросов",
                 )
-
                 st.plotly_chart(fig_requests, use_container_width=True)
             else:
-                st.warning(
-                    "Не удалось определить ISO-коды для стран в выбранном диапазоне."
-                )
+                st.warning("Не удалось определить ISO-коды для стран в выбранном диапазоне.")
         else:
             st.info("Нет данных о запросах по странам для выбранных фильтров.")
 
@@ -270,10 +260,7 @@ with tab2:
         df_country_errors = run_query(CLIENT, country_error_query)
 
         if not df_country_errors.empty:
-
-            df_country_errors["iso_alpha"] = df_country_errors["country"].apply(
-                get_country_iso_alpha3
-            )
+            df_country_errors["iso_alpha"] = df_country_errors["country"].apply(get_country_iso_alpha3)
             df_country_errors = df_country_errors.dropna(subset=["iso_alpha"])
 
             if not df_country_errors.empty:
@@ -286,13 +273,12 @@ with tab2:
                     title="Процент ошибок (%)",
                 )
                 st.plotly_chart(fig_errors, use_container_width=True)
-
         else:
             st.info("Нет данных об ошибках по странам для выбранных фильтров.")
 
     st.subheader("Таблица с гео-данными и ошибками")
 
-    if not df_country_errors.empty:
+    if not df_country_errors.empty and not df_country_errors.dropna(subset=['error_rate']).empty:
         st.dataframe(
             df_country_errors[
                 ["country", "total_count", "error_count", "error_rate"]
@@ -300,7 +286,6 @@ with tab2:
             use_container_width=True,
             hide_index=True,
         )
-
 
 with tab3:
     col1, col2 = st.columns(2)
@@ -311,7 +296,7 @@ with tab3:
             CLIENT,
             f"SELECT req.page AS page, count() AS hits {FROM_SQL} {access_where_sql} GROUP BY req.page ORDER BY hits DESC LIMIT 10",
         )
-        st.dataframe(pages_df, use_container_width=True)
+        st.dataframe(pages_df, use_container_width=True, hide_index=True)
 
         st.subheader("Топ 10 IP по объему трафика (MB)")
 
@@ -343,7 +328,7 @@ with tab3:
             CLIENT,
             f"SELECT ip.ip AS ip, count() as errors {FROM_SQL} {error_ip_where_sql} GROUP BY ip.ip ORDER BY errors DESC LIMIT 10",
         )
-        st.dataframe(ip_errors_df, use_container_width=True)
+        st.dataframe(ip_errors_df, use_container_width=True, hide_index=True)
 
     st.subheader("Тепловая карта ошибок: Страница vs Статус")
 
@@ -370,7 +355,6 @@ with tab3:
         )
         st.plotly_chart(fig_heatmap, use_container_width=True)
 
-
 with tab4:
     st.subheader("Обнаруженные аномалии")
     anomaly_where = f"WHERE f.timestamp BETWEEN toDateTime('{start_time}') AND toDateTime('{end_time}') AND f.is_anomaly = 1"
@@ -389,7 +373,6 @@ with tab4:
         """
         df_anomalies_timeline = run_query(CLIENT, anomaly_timeline_query)
         if not df_anomalies_timeline.empty:
-
             fig_timeline = px.scatter(
                 df_anomalies_timeline,
                 x="timestamp",
@@ -434,8 +417,7 @@ with tab4:
     """
     df_anomalies_table = run_query(CLIENT, anomaly_table_query)
     if not df_anomalies_table.empty:
-        st.dataframe(df_anomalies_table, use_container_width=True)
-
+        st.dataframe(df_anomalies_table, use_container_width=True, hide_index=True)
 
 with tab5:
     st.subheader("Анализ логов ошибок")
@@ -462,7 +444,6 @@ with tab5:
             st.plotly_chart(fig_top_errors, use_container_width=True)
 
     with col2:
-
         st.subheader("Динамика ошибок по уровням (error/warn)")
         error_level_query = f"""
         SELECT
@@ -492,10 +473,9 @@ with tab5:
     """
     df_errors_table = run_query(CLIENT, errors_table_query)
     if not df_errors_table.empty:
-        st.dataframe(df_errors_table, use_container_width=True)
+        st.dataframe(df_errors_table, use_container_width=True, hide_index=True)
     else:
         st.info("Ошибки сервера не найдены в выбранном диапазоне.")
-
 
 with tab6:
     st.subheader("Прогноз нагрузки на сервер (запросов в час)")
@@ -512,12 +492,10 @@ with tab6:
     df_predictions = run_query(CLIENT, predictions_query)
 
     if not df_actuals.empty and not df_predictions.empty:
-
         CRITICAL_LOAD_THRESHOLD = df_actuals["actual_requests"].quantile(0.95)
 
         future_predictions = df_predictions[df_predictions["hour"] > datetime.now()]
         if not future_predictions.empty:
-
             peak_prediction = future_predictions.sort_values(
                 "predicted_upper", ascending=False
             ).iloc[0]
@@ -547,9 +525,7 @@ with tab6:
 
             df_pred_main = df_predictions[["hour", "predicted_requests"]].copy()
             df_pred_main["type"] = "Прогноз"
-            df_pred_main.rename(
-                columns={"predicted_requests": "requests"}, inplace=True
-            )
+            df_pred_main.rename(columns={"predicted_requests": "requests"}, inplace=True)
 
             source = pd.concat([df_actuals[["hour", "requests", "type"]], df_pred_main])
             line = (
@@ -570,6 +546,8 @@ with tab6:
         else:
             st.warning("Нет будущих прогнозов для отображения.")
     else:
-        st.warning(
-            "Нет данных для построения прогноза. Сначала необходимо запустить скрипты обучения и генерации прогнозов."
-        )
+        st.warning("Нет данных для построения прогноза. Сначала необходимо запустить скрипты обучения и генерации прогнозов.")
+
+# Эти две строки в конце файла будут перезапускать скрипт каждые 15 секунд
+time.sleep(15)
+st.rerun()
