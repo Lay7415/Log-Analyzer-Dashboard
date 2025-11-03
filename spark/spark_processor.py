@@ -28,12 +28,11 @@ CLICKHOUSE_URL = "jdbc:clickhouse://clickhouse:8123/default"
 CLICKHOUSE_TABLE = "fact_nginx_events"
 GEO_DB_PATH = "/opt/spark-apps/GeoLite2-Country.mmdb"
 
-# Behavioral thresholds
+
 REQUEST_RATE_THRESHOLD = 20
 LOGIN_ATTACK_THRESHOLD = 10
 SCANNING_THRESHOLD = 15
 
-# Signature-based attack patterns
 SQLI_PATTERN = r"('|%27|--|%2D%2D|union|%75%6E%69%6F%6E)"
 PATH_TRAVERSAL_PATTERN = r"(\.\./|%2E%2E%2F)"
 VULN_SCAN_PATTERN = r"(wp-admin|phpmyadmin|/.git|/solr)"
@@ -82,7 +81,6 @@ def get_country_from_ip(ip):
         return "Unknown"
     except Exception:
         return "Error"
-
 
 
 kafka_schema = StructType(
@@ -183,7 +181,6 @@ def write_to_clickhouse(batch_df, batch_id):
     print(f"--- Processing Batch {batch_id} ---")
     batch_df.cache()
 
-    # STAGE 1: Signature Analysis
     signature_df = batch_df.withColumn(
         "signature_anomaly_type",
         when(col("page").rlike(SQLI_PATTERN), "SQL Injection")
@@ -193,7 +190,6 @@ def write_to_clickhouse(batch_df, batch_id):
         .otherwise(lit(None)),
     )
 
-    # STAGE 2: Behavioral Analysis
     behavioral_df = (
         batch_df.filter(col("log_type") == "access")
         .groupBy("ip")
@@ -212,28 +208,25 @@ def write_to_clickhouse(batch_df, batch_id):
             .otherwise(lit(None)),
         )
     )
-    
+
     print("==== batch schema ====")
     batch_df.printSchema()
     batch_df.show(5, truncate=False)
-    
+
     base_df = (
         signature_df.join(behavioral_df, "ip", "left")
-        # объединяем сигнатуры и поведение
         .withColumn(
             "anomaly_type",
             coalesce(col("signature_anomaly_type"), col("behavioral_anomaly_type")),
-        ).withColumn(
+        )
+        .withColumn(
             "is_anomaly",
             when(col("anomaly_type").isNotNull(), lit(1)).otherwise(lit(0)),
         )
-        # создаём country прямо здесь из ip — так мы точно гарантируем её наличие в схеме
         .withColumn("country", coalesce(get_country_from_ip(col("ip")), lit("Unknown")))
-        # если нужно, обеспечим пустую строку для anomaly_type
         .withColumn("anomaly_type", coalesce(col("anomaly_type"), lit("")))
     )
 
-    # STAGE 4: Extract and write dimensions
     dim_ip_df = (
         base_df.select("ip", "country")
         .distinct()
@@ -272,7 +265,6 @@ def write_to_clickhouse(batch_df, batch_id):
     if not dim_anomaly_df.rdd.isEmpty():
         write_dim_table(dim_anomaly_df, "dim_anomaly_type")
 
-    # STAGE 5: Join dimension IDs back to create the fact table
     fact_df = (
         base_df.join(dim_ip_df, ["ip", "country"], "left")
         .join(dim_request_df, ["request", "method", "page", "referrer"], "left")
@@ -281,7 +273,6 @@ def write_to_clickhouse(batch_df, batch_id):
         .join(dim_anomaly_df, "anomaly_type", "left")
     )
 
-    # STAGE 6: Write to the fact table
     (
         fact_df.select(
             "timestamp",

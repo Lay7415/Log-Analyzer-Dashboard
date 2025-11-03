@@ -4,16 +4,16 @@ from clickhouse_driver import Client
 import pickle
 import os
 
-CLICKHOUSE_HOST = 'clickhouse'
-MODEL_DIR = '/opt/spark-apps/model'
-MODEL_PATH = os.path.join(MODEL_DIR, 'prophet_model.pkl')
+CLICKHOUSE_HOST = "clickhouse"
+MODEL_DIR = "/opt/spark-apps/model"
+MODEL_PATH = os.path.join(MODEL_DIR, "prophet_model.pkl")
 
 print("--- Начало обучения модели прогнозирования ---")
 
-# 1. Загрузка исторических данных из ClickHouse
+
 print(f"Подключение к ClickHouse ({CLICKHOUSE_HOST})...")
 client = Client(host=CLICKHOUSE_HOST)
-# ИЗМЕНЕНИЕ: Запрос к новой таблице фактов
+
 query = """
 SELECT
     toStartOfHour(timestamp) as ds,
@@ -28,24 +28,24 @@ data, columns = client.execute(query, with_column_types=True)
 df = pd.DataFrame(data, columns=[c[0] for c in columns])
 print(f"Загружено {len(df)} строк исторических данных.")
 
-df['ds'] = pd.to_datetime(df['ds'])
+df["ds"] = pd.to_datetime(df["ds"])
 
 if len(df) < 2:
     print("❌ Недостаточно данных для обучения. Требуется как минимум 2 точки.")
     exit()
 
-# 2. Обучение модели Prophet
+
 print("Обучение модели Prophet...")
 model = Prophet(daily_seasonality=True, weekly_seasonality=True)
 model.fit(df)
 print("✅ Модель успешно обучена.")
 
-# 3. Сохранение модели в файл
+
 print(f"Сохранение модели в файл: {MODEL_PATH}")
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-with open(MODEL_PATH, 'wb') as f:
+with open(MODEL_PATH, "wb") as f:
     pickle.dump(model, f)
 
 print("--- Обучение модели завершено ---")

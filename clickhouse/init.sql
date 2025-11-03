@@ -1,6 +1,3 @@
--- Dimension Tables
--- Using ReplacingMergeTree to handle deduplication automatically based on the ID.
-
 CREATE TABLE IF NOT EXISTS dim_ip (
     ip_id UInt64,
     ip String,
@@ -56,7 +53,6 @@ ENGINE = MergeTree()
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (timestamp, ip_id);
 
--- Predictions table remains unchanged
 CREATE TABLE IF NOT EXISTS nginx_predictions (
     timestamp DateTime,
     predicted_requests Float64,
